@@ -17,6 +17,7 @@ torchaudio==2.1.2
 pyaudioop==0.1.0  # Fix for audioop in Python 3.13+
 pydub==0.25.1
 ffmpeg-python==0.2.0
+hf-xet==1.2.0
 
 # Speaker Diarization
 pyannote.audio==3.1.1
