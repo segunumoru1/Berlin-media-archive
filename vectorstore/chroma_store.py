@@ -6,12 +6,15 @@ Uses OpenAI embeddings.
 
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Literal, cast
 from datetime import datetime
 
 import chromadb
 from chromadb.config import Settings
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 from embeddings.openai_embeddings import OpenAIEmbeddings
 from ingestion.audio_ingestion import TranscriptSegment
@@ -49,8 +52,7 @@ class UnifiedVectorStore:
         embedding_model = embedding_model or settings.embedding_model
         self.embeddings = OpenAIEmbeddings(model=embedding_model)
         
-        logger.info(f"Using embedding model: {self.embeddings.get_model_name()}")
-        logger.info(f"Embedding dimension: {self.embeddings.get_embedding_dimension()}")
+        logger.info(f"Using embedding model: {self.embeddings.model}")
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(
@@ -67,8 +69,7 @@ class UnifiedVectorStore:
                 name=self.collection_name,
                 metadata={
                     "description": "Berlin Media Archive - Multi-modal RAG",
-                    "embedding_model": self.embeddings.get_model_name(),
-                    "embedding_dimension": self.embeddings.get_embedding_dimension(),
+                    "embedding_model": self.embeddings.model,
                     "created_at": datetime.now().isoformat()
                 }
             )
@@ -236,10 +237,10 @@ class UnifiedVectorStore:
     def search(
         self,
         query: str,
-        n_results: int = None,
+        n_results: Optional[int] = None,
         filter_metadata: Optional[Dict] = None,
         include_embeddings: bool = False
-    ) -> Dict[str, Any]:
+    ):
         """
         Semantic search in the vector store.
         
@@ -263,7 +264,7 @@ class UnifiedVectorStore:
             query_embedding = self.embeddings.embed_text(query)
             
             # Prepare include list
-            include = ["documents", "metadatas", "distances"]
+            include: List[Literal["documents", "embeddings", "metadatas", "distances", "uris", "data"]] = ["documents", "metadatas", "distances"]
             if include_embeddings:
                 include.append("embeddings")
             
@@ -285,7 +286,7 @@ class UnifiedVectorStore:
     def hybrid_search(
         self,
         query: str,
-        n_results: int = None,
+        n_results: int,
         filter_metadata: Optional[Dict] = None,
         semantic_weight: float = 0.7
     ) -> List[Dict[str, Any]]:
@@ -369,10 +370,13 @@ class UnifiedVectorStore:
             # Get top results
             top_indices = np.argsort(scores)[::-1][:n_results]
             
+            # Handle case where metadatas might be None
+            metadatas = all_docs.get("metadatas") or [{}] * len(all_docs["ids"])
+            
             return {
                 "ids": [[all_docs["ids"][i] for i in top_indices]],
                 "documents": [[all_docs["documents"][i] for i in top_indices]],
-                "metadatas": [[all_docs["metadatas"][i] for i in top_indices]],
+                "metadatas": [[metadatas[i] for i in top_indices]],
                 "distances": [[1.0 / (1.0 + scores[i]) for i in top_indices]]
             }
             
@@ -382,8 +386,8 @@ class UnifiedVectorStore:
     
     def _combine_results(
         self,
-        semantic_results: Dict,
-        keyword_results: Dict,
+        semantic_results: Any,
+        keyword_results: Any,
         semantic_weight: float,
         keyword_weight: float,
         n_results: int
@@ -433,7 +437,7 @@ class UnifiedVectorStore:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:n_results]
     
-    def _format_search_results(self, results: Dict) -> List[Dict[str, Any]]:
+    def _format_search_results(self, results: Any) -> List[Dict[str, Any]]:
         """Format search results."""
         formatted = []
         for i in range(len(results["ids"][0])):
@@ -450,7 +454,7 @@ class UnifiedVectorStore:
         self,
         filter_metadata: Dict,
         limit: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ):
         """Get documents by metadata filter."""
         logger.info(f"Getting documents with filter: {filter_metadata}")
         try:
@@ -491,11 +495,10 @@ class UnifiedVectorStore:
                 "audio_segments": len(audio_docs["ids"]),
                 "text_chunks": len(text_docs["ids"]),
                 "collection_name": self.collection_name,
-                "embedding_model": self.embeddings.get_model_name(),
-                "embedding_dimension": self.embeddings.get_embedding_dimension()
+                "embedding_model": self.embeddings.model
             }
         except Exception as e:
-            logger.error(f"Failed to get stats: {e}")
+            logger.error(f"Failed to get collection stats: {e}")
             raise
     
     def reset_collection(self):
@@ -507,7 +510,7 @@ class UnifiedVectorStore:
                 name=self.collection_name,
                 metadata={
                     "description": "Berlin Media Archive - Multi-modal RAG",
-                    "embedding_model": self.embeddings.get_model_name(),
+                    "embedding_model": self.embeddings.model,
                     "created_at": datetime.now().isoformat()
                 }
             )
