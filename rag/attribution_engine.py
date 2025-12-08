@@ -72,8 +72,8 @@ class AttributionEngine:
         self,
         vector_store: UnifiedVectorStore,
         llm_model: Optional[str] = None,
-        temperature: float = None,
-        use_hybrid_search: bool = None
+        temperature: Optional[float] = None,
+        use_hybrid_search: Optional[bool] = None
     ):
         """
         Initialize attribution engine.
@@ -126,7 +126,7 @@ Be conversational but precise. Combine information from multiple sources when re
     def query_archive(
         self,
         question: str,
-        n_results: int = None,
+        n_results: Optional[int] = None,
         filter_metadata: Optional[Dict] = None,
         return_raw_chunks: bool = True
     ) -> QueryResponse:
@@ -197,7 +197,7 @@ Be conversational but precise. Combine information from multiple sources when re
     def _retrieve_chunks(
         self,
         query: str,
-        n_results: int = None,
+        n_results: Optional[int] = None,
         filter_metadata: Optional[Dict] = None
     ) -> List[Dict[str, Any]]:
         """
@@ -312,7 +312,8 @@ ANSWER:"""
                 max_tokens=1000
             )
             
-            answer = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            answer = content.strip() if content else "I apologize, but I was unable to generate a response based on the provided sources."
             logger.debug(f"Generated answer: {answer[:100]}...")
             
             return answer
@@ -435,17 +436,17 @@ ANSWER:"""
         try:
             from pathlib import Path
             
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_file = Path(output_path)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
             
             # Save as JSON
-            with open(output_path, "w", encoding="utf-8") as f:
+            with open(output_file, "w", encoding="utf-8") as f:
                 f.write(response.to_json())
             
-            logger.info(f"Response saved to: {output_path}")
+            logger.info(f"Response saved to: {output_file}")
             
             # Also save a human-readable version
-            txt_path = output_path.with_suffix('.txt')
+            txt_path = output_file.with_suffix('.txt')
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(f"QUERY: {response.query}\n")
                 f.write("=" * 80 + "\n\n")

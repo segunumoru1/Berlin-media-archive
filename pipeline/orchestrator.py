@@ -6,6 +6,7 @@ Coordinates the entire multi-modal RAG pipeline.
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
+from datetime import datetime
 
 from ingestion.audio_ingestion import AudioIngestionPipeline, TranscriptSegment
 from ingestion.document_ingestion import DocumentIngestionPipeline, DocumentChunk
@@ -157,8 +158,8 @@ class BerlinArchivePipeline:
         
         # Ingest audio files
         if audio_dir:
-            audio_dir = Path(audio_dir)
-            audio_files = list(audio_dir.glob("*.mp3")) + list(audio_dir.glob("*.wav"))
+            audio_path = Path(audio_dir)
+            audio_files = list(audio_path.glob("*.mp3")) + list(audio_path.glob("*.wav"))
             logger.info(f"Found {len(audio_files)} audio files")
             
             for audio_file in audio_files:
@@ -172,8 +173,8 @@ class BerlinArchivePipeline:
         
         # Ingest documents
         if documents_dir:
-            documents_dir = Path(documents_dir)
-            document_files = list(documents_dir.glob("*.pdf"))
+            docs_path = Path(documents_dir)
+            document_files = list(docs_path.glob("*.pdf"))
             logger.info(f"Found {len(document_files)} document files")
             
             for doc_file in document_files:

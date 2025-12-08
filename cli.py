@@ -8,13 +8,43 @@ import json
 import click
 from pathlib import Path
 from typing import Optional
+import os
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utils.config import settings, ensure_directories
-from utils.logger import setup_logging
 from loguru import logger
+
+
+def setup_logging(log_level: str = "INFO", log_file: str = "cli.log"):
+    """Setup logging configuration"""
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
+    )
+    logger.add(
+        log_file,
+        rotation="10 MB",
+        level=log_level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}"
+    )
+
+
+def ensure_directories():
+    """Ensure all necessary directories exist"""
+    dirs = [
+        os.getenv("DATA_DIR", "./data"),
+        os.getenv("AUDIO_DIR", "./data/audio"),
+        os.getenv("DOCUMENTS_DIR", "./data/documents"),
+        os.getenv("OUTPUT_DIR", "./output"),
+        os.getenv("LOGS_DIR", "./logs"),
+        os.getenv("VECTORSTORE_PATH", "./data/vectorstore"),
+    ]
+    for dir_path in dirs:
+        Path(dir_path).mkdir(parents=True, exist_ok=True)
+    logger.debug(f"Ensured directories exist: {dirs}")
 
 
 @click.group()
@@ -45,7 +75,8 @@ def audio(audio_file, output_dir, enable_diarization):
         
         pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
         
-        output_dir = output_dir or str(Path(settings.output_dir) / "audio")
+        output_dir = output_dir or os.path.join(os.getenv("OUTPUT_DIR", "./output"), "audio")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         
         segments, metadata = pipeline.ingest_audio(audio_file, output_dir)
         
@@ -53,9 +84,8 @@ def audio(audio_file, output_dir, enable_diarization):
         click.echo(f"   - Duration: {metadata.get('duration_seconds', 'N/A'):.2f}s")
         click.echo(f"   - Segments: {len(segments)}")
         
-        speakers = set(seg.speaker for seg in segments if seg.speaker)
-        if speakers:
-            click.echo(f"   - Speakers: {', '.join(speakers)}")
+        if metadata.get('speakers'):
+            click.echo(f"   - Speakers: {', '.join(metadata['speakers'])}")
         
         click.echo(f"\n💾 Output saved to: {output_dir}")
         
@@ -68,8 +98,8 @@ def audio(audio_file, output_dir, enable_diarization):
 @ingest.command()
 @click.argument('document_file', type=click.Path(exists=True))
 @click.option('--output-dir', '-o', type=click.Path(), help='Output directory')
-@click.option('--chunk-size', '-c', type=int, default=1000, help='Chunk size')
-@click.option('--chunk-overlap', type=int, default=200, help='Chunk overlap')
+@click.option('--chunk-size', '-c', type=int, help='Chunk size (default from env)')
+@click.option('--chunk-overlap', type=int, help='Chunk overlap (default from env)')
 def document(document_file, output_dir, chunk_size, chunk_overlap):
     """Ingest a PDF document with intelligent chunking"""
     try:
@@ -77,12 +107,17 @@ def document(document_file, output_dir, chunk_size, chunk_overlap):
         
         from ingestion.document_ingestion import DocumentIngestionPipeline
         
+        # Use env defaults if not provided
+        chunk_size = chunk_size or int(os.getenv("PDF_CHUNK_SIZE", "1000"))
+        chunk_overlap = chunk_overlap or int(os.getenv("PDF_CHUNK_OVERLAP", "200"))
+        
         pipeline = DocumentIngestionPipeline(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap
         )
         
-        output_dir = output_dir or str(Path(settings.output_dir) / "documents")
+        output_dir = output_dir or os.path.join(os.getenv("OUTPUT_DIR", "./output"), "documents")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         
         chunks, metadata = pipeline.ingest_document(document_file, output_dir)
         
@@ -99,35 +134,58 @@ def document(document_file, output_dir, chunk_size, chunk_overlap):
 
 @cli.command()
 @click.argument('question')
-@click.option('--top-k', '-k', type=int, default=5, help='Number of results')
+@click.option('--top-k', '-k', type=int, help='Number of results (default from env)')
 @click.option('--filter-source', '-f', type=str, help='Filter by source type (audio/document)')
 @click.option('--filter-speaker', '-s', type=str, help='Filter by speaker')
 def query(question, top_k, filter_source, filter_speaker):
     """Query the archive with natural language"""
     try:
+        top_k = top_k or int(os.getenv("TOP_K_RESULTS", "5"))
+        
         click.echo(f"🔍 Querying: {question}")
         click.echo(f"   Top-K: {top_k}")
         
         from rag.attribution_engine import AttributionEngine
+        from embeddings.openai_embeddings import OpenAIEmbeddings
+        from pipeline.orchestrator import BerlinArchivePipeline
+        from vectorstore.chroma_store import UnifiedVectorStore
         
-        engine = AttributionEngine()
+        # Initialize components
+        embeddings = OpenAIEmbeddings()
+        vector_store = UnifiedVectorStore()
+        orchestrator = BerlinArchivePipeline()
+        attribution_engine = AttributionEngine(vector_store=vector_store)
         
+        # Build filters
         filters = {}
         if filter_source:
             filters['source_type'] = filter_source
         if filter_speaker:
             filters['speaker'] = filter_speaker
         
-        result = engine.query(question, top_k=top_k, filters=filters)
+        # Process query
+        result = orchestrator.process_query(
+            query=question,
+            top_k=top_k,
+            filters=filters
+        )
+        
+        # Add attribution
+        attribution = attribution_engine.generate_attribution(
+            query=question,
+            answer=result['answer'],
+            sources=result['sources']
+        )
         
         click.echo(f"\n💬 Answer:\n{result['answer']}")
         
-        click.echo(f"\n📚 Sources ({len(result['sources'])}):")
-        for i, source in enumerate(result['sources'], 1):
-            click.echo(f"   {i}. {source['citation']}")
+        if attribution and attribution.get('citations'):
+            click.echo(f"\n📚 Sources ({len(attribution['citations'])}):")
+            for i, citation in enumerate(attribution['citations'], 1):
+                click.echo(f"   {i}. {citation}")
         
-        if result.get('confidence'):
-            click.echo(f"\n📊 Confidence: {result['confidence']:.2f}")
+        if attribution and attribution.get('confidence_score'):
+            click.echo(f"\n📊 Confidence: {attribution['confidence_score']:.2f}")
         
     except Exception as e:
         logger.error(f"Query failed: {e}", exc_info=True)
@@ -152,23 +210,30 @@ def run(test_cases, output):
         from rag_evaluator.llm_rag_evaluator import LLMRAGEvaluator
         from rag_evaluator.test_cases import EvaluationTestCases
         
+        # Check if evaluation is enabled
+        if os.getenv("ENABLE_EVALUATION", "true").lower() != "true":
+            click.echo("⚠️  Evaluation is disabled in configuration")
+            return
+        
         evaluator = LLMRAGEvaluator()
         
         # Load test cases
         if test_cases:
             with open(test_cases, 'r') as f:
                 cases = json.load(f)
+            click.echo(f"   Loaded {len(cases)} test cases from file")
         else:
             click.echo("ℹ️  Using default test cases")
-            cases = EvaluationTestCases.get_sample_test_cases()
+            test_case_generator = EvaluationTestCases()
+            cases = test_case_generator.get_sample_test_cases()
         
         click.echo(f"   Test cases: {len(cases)}")
         
         # Run evaluation
-        output_path = output or str(Path(settings.output_dir) / "evaluation_results.json")
+        output_path = output or os.path.join(os.getenv("OUTPUT_DIR", "./output"), "evaluation_results.json")
         
-        batch_result = evaluator.batch_evaluate(
-            cases,
+        results = evaluator.batch_evaluate(
+            test_cases=cases,
             save_results=True,
             output_path=output_path
         )
@@ -176,12 +241,18 @@ def run(test_cases, output):
         # Display results
         click.echo(f"\n✅ Evaluation complete!")
         click.echo(f"\n📊 Results:")
-        click.echo(f"   - Average Faithfulness: {batch_result.avg_faithfulness:.2f}")
-        click.echo(f"   - Average Relevance: {batch_result.avg_relevance:.2f}")
-        click.echo(f"   - Average Citation Quality: {batch_result.avg_citation_quality:.2f}")
-        click.echo(f"   - Overall Score: {batch_result.avg_overall:.2f}")
-        click.echo(f"\n   - Grade Distribution: {batch_result.grade_distribution}")
-        click.echo(f"   - Production Ready: {batch_result.production_ready_count}/{batch_result.total_cases} ({batch_result.production_ready_percentage:.1f}%)")
+        
+        if isinstance(results, dict):
+            click.echo(f"   - Average Faithfulness: {results.get('avg_faithfulness', 0):.2f}")
+            click.echo(f"   - Average Relevance: {results.get('avg_relevance', 0):.2f}")
+            click.echo(f"   - Average Citation Quality: {results.get('avg_citation_quality', 0):.2f}")
+            click.echo(f"   - Overall Score: {results.get('avg_overall', 0):.2f}")
+            
+            if 'grade_distribution' in results:
+                click.echo(f"\n   - Grade Distribution: {results['grade_distribution']}")
+            
+            if 'production_ready_percentage' in results:
+                click.echo(f"   - Production Ready: {results.get('production_ready_count', 0)}/{results.get('total_cases', 0)} ({results['production_ready_percentage']:.1f}%)")
         
         click.echo(f"\n💾 Detailed results saved to: {output_path}")
         
@@ -214,24 +285,27 @@ def single(question, answer, context, ground_truth):
         
         click.echo(f"\n✅ Evaluation complete!")
         click.echo(f"\n📊 Scores:")
-        click.echo(f"   - Faithfulness: {result.faithfulness:.2f}")
-        click.echo(f"   - Relevance: {result.relevance:.2f}")
-        click.echo(f"   - Citation Quality: {result.citation_quality:.2f}")
-        click.echo(f"   - Overall: {result.overall_score:.2f}")
-        click.echo(f"   - Grade: {result.grade}")
         
-        production_ready = "✅ YES" if result.is_production_ready() else "❌ NO"
-        click.echo(f"\n   Production Ready: {production_ready}")
-        
-        if result.errors:
-            click.echo(f"\n⚠️  Errors:")
-            for error in result.errors:
-                click.echo(f"   - {error}")
-        
-        if result.warnings:
-            click.echo(f"\n⚠️  Warnings:")
-            for warning in result.warnings:
-                click.echo(f"   - {warning}")
+        if isinstance(result, dict):
+            click.echo(f"   - Faithfulness: {result.get('faithfulness', 0):.2f}")
+            click.echo(f"   - Relevance: {result.get('relevance', 0):.2f}")
+            click.echo(f"   - Citation Quality: {result.get('citation_quality', 0):.2f}")
+            click.echo(f"   - Overall: {result.get('overall_score', 0):.2f}")
+            click.echo(f"   - Grade: {result.get('grade', 'N/A')}")
+            
+            is_production_ready = result.get('overall_score', 0) >= 0.7
+            production_ready = "✅ YES" if is_production_ready else "❌ NO"
+            click.echo(f"\n   Production Ready: {production_ready}")
+            
+            if result.get('errors'):
+                click.echo(f"\n⚠️  Errors:")
+                for error in result['errors']:
+                    click.echo(f"   - {error}")
+            
+            if result.get('warnings'):
+                click.echo(f"\n⚠️  Warnings:")
+                for warning in result['warnings']:
+                    click.echo(f"   - {warning}")
         
     except Exception as e:
         logger.error(f"Evaluation failed: {e}", exc_info=True)
@@ -243,18 +317,21 @@ def single(question, answer, context, ground_truth):
 def server():
     """Start the API server"""
     try:
+        api_host = os.getenv("API_HOST", "0.0.0.0")
+        api_port = int(os.getenv("API_PORT", "8000"))
+        
         click.echo("🚀 Starting Berlin Media Archive API server...")
-        click.echo(f"📍 Server: http://{settings.api_host}:{settings.api_port}")
-        click.echo(f"📚 API Docs: http://{settings.api_host}:{settings.api_port}/docs")
+        click.echo(f"📍 Server: http://{api_host}:{api_port}")
+        click.echo(f"📚 API Docs: http://{api_host}:{api_port}/docs")
         click.echo("\nPress Ctrl+C to stop\n")
         
         import uvicorn
         uvicorn.run(
             "main:app",
-            host=settings.api_host,
-            port=settings.api_port,
+            host=api_host,
+            port=api_port,
             reload=True,
-            log_level="info"
+            log_level=os.getenv("LOG_LEVEL", "INFO").lower()
         )
         
     except KeyboardInterrupt:
@@ -291,32 +368,154 @@ def status():
         click.echo("🏛️  Berlin Media Archive - System Status")
         click.echo("=" * 60)
         
+        # Load environment variables
+        from dotenv import load_dotenv
+        load_dotenv()
+        
         click.echo(f"\n📁 Directories:")
-        click.echo(f"   - Data: {settings.data_dir}")
-        click.echo(f"   - Audio: {settings.audio_dir}")
-        click.echo(f"   - Documents: {settings.documents_dir}")
-        click.echo(f"   - Output: {settings.output_dir}")
-        click.echo(f"   - Vector Store: {settings.vectorstore_path}")
+        click.echo(f"   - Data: {os.getenv('DATA_DIR', './data')}")
+        click.echo(f"   - Audio: {os.getenv('AUDIO_DIR', './data/audio')}")
+        click.echo(f"   - Documents: {os.getenv('DOCUMENTS_DIR', './data/documents')}")
+        click.echo(f"   - Output: {os.getenv('OUTPUT_DIR', './output')}")
+        click.echo(f"   - Vector Store: {os.getenv('VECTORSTORE_PATH', './data/vectorstore')}")
         
         click.echo(f"\n⚙️  Configuration:")
-        click.echo(f"   - LLM Model: {settings.llm_model}")
-        click.echo(f"   - Embedding Model: {settings.embedding_model}")
-        click.echo(f"   - Whisper Model: {settings.whisper_model}")
-        click.echo(f"   - Vector Store: {settings.vectorstore_type}")
-        click.echo(f"   - Hybrid Search: {'Enabled' if settings.enable_hybrid_search else 'Disabled'}")
-        click.echo(f"   - Speaker Diarization: {'Enabled' if settings.enable_speaker_diarization else 'Disabled'}")
+        click.echo(f"   - LLM Model: {os.getenv('LLM_MODEL', 'gpt-4-turbo-preview')}")
+        click.echo(f"   - Embedding Model: {os.getenv('EMBEDDING_MODEL', 'text-embedding-3-large')}")
+        click.echo(f"   - Whisper Model: {os.getenv('WHISPER_MODEL', 'base')}")
+        click.echo(f"   - Vector Store: {os.getenv('VECTORSTORE_TYPE', 'chroma')}")
         
-        # Check API key
-        import os
-        api_key = os.getenv("OPENAI_API_KEY")
-        api_key_status = "✅ Set" if api_key else "❌ Not set"
+        enable_hybrid = os.getenv('ENABLE_HYBRID_SEARCH', 'true').lower() == 'true'
+        enable_diarization = os.getenv('ENABLE_SPEAKER_DIARIZATION', 'true').lower() == 'true'
+        enable_evaluation = os.getenv('ENABLE_EVALUATION', 'true').lower() == 'true'
+        
+        click.echo(f"   - Hybrid Search: {'✅ Enabled' if enable_hybrid else '❌ Disabled'}")
+        click.echo(f"   - Speaker Diarization: {'✅ Enabled' if enable_diarization else '❌ Disabled'}")
+        click.echo(f"   - Evaluation: {'✅ Enabled' if enable_evaluation else '❌ Disabled'}")
+        
+        # Check API keys
+        openai_key = os.getenv("OPENAI_API_KEY")
+        hf_key = os.getenv("HUGGINGFACE_API_KEY")
+        
         click.echo(f"\n🔑 API Keys:")
-        click.echo(f"   - OpenAI: {api_key_status}")
+        click.echo(f"   - OpenAI: {'✅ Set' if openai_key else '❌ Not set'}")
+        click.echo(f"   - HuggingFace: {'✅ Set' if hf_key else '❌ Not set'}")
         
-        click.echo("\n✅ System ready!")
+        # Check directory existence
+        click.echo(f"\n📂 Directory Status:")
+        dirs_to_check = [
+            os.getenv('DATA_DIR', './data'),
+            os.getenv('AUDIO_DIR', './data/audio'),
+            os.getenv('DOCUMENTS_DIR', './data/documents'),
+            os.getenv('OUTPUT_DIR', './output'),
+            os.getenv('VECTORSTORE_PATH', './data/vectorstore'),
+        ]
+        
+        for dir_path in dirs_to_check:
+            exists = Path(dir_path).exists()
+            status_icon = "✅" if exists else "❌"
+            click.echo(f"   {status_icon} {dir_path}")
+        
+        # Overall status
+        all_keys_set = openai_key is not None
+        all_dirs_exist = all(Path(d).exists() for d in dirs_to_check)
+        
+        click.echo()
+        if all_keys_set and all_dirs_exist:
+            click.echo("✅ System ready!")
+        else:
+            click.echo("⚠️  System has missing requirements")
+            if not all_keys_set:
+                click.echo("   - Set required API keys in .env file")
+            if not all_dirs_exist:
+                click.echo("   - Run 'ensure_directories()' to create missing directories")
         
     except Exception as e:
         logger.error(f"Status check failed: {e}", exc_info=True)
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+def init():
+    """Initialize the Berlin Media Archive (create directories, check dependencies)"""
+    try:
+        click.echo("🚀 Initializing Berlin Media Archive...")
+        
+        # Ensure directories
+        click.echo("\n📁 Creating directories...")
+        ensure_directories()
+        click.echo("   ✅ Directories created")
+        
+        # Check .env file
+        click.echo("\n🔧 Checking configuration...")
+        if not Path(".env").exists():
+            click.echo("   ⚠️  .env file not found")
+            click.echo("   Creating .env from template...")
+            
+            env_template = """# API Keys
+OPENAI_API_KEY=your_openai_api_key_here
+HUGGINGFACE_API_KEY=your_huggingface_api_key_here
+
+# LLM Configuration
+LLM_MODEL=gpt-4-turbo-preview
+LLM_TEMPERATURE=0.1
+EMBEDDING_MODEL=text-embedding-3-large
+
+# Audio Processing
+WHISPER_MODEL=base
+AUDIO_CHUNK_LENGTH=30
+ENABLE_SPEAKER_DIARIZATION=true
+
+# Document Processing
+PDF_CHUNK_SIZE=1000
+PDF_CHUNK_OVERLAP=200
+
+# Vector Store
+VECTORSTORE_TYPE=chroma
+VECTORSTORE_PATH=./data/vectorstore
+COLLECTION_NAME=berlin_archive
+
+# Search Configuration
+ENABLE_HYBRID_SEARCH=true
+TOP_K_RESULTS=5
+SIMILARITY_THRESHOLD=0.7
+BM25_WEIGHT=0.3
+
+# Evaluation
+ENABLE_EVALUATION=true
+EVALUATOR_MODEL=gpt-4-turbo-preview
+
+# File Paths
+DATA_DIR=./data
+AUDIO_DIR=./data/audio
+DOCUMENTS_DIR=./data/documents
+OUTPUT_DIR=./output
+LOGS_DIR=./logs
+
+# API Server
+API_HOST=0.0.0.0
+API_PORT=8000
+
+# Logging
+LOG_LEVEL=INFO
+"""
+            with open(".env", "w") as f:
+                f.write(env_template)
+            
+            click.echo("   ✅ .env file created")
+            click.echo("   ⚠️  Please edit .env and add your API keys")
+        else:
+            click.echo("   ✅ .env file found")
+        
+        click.echo("\n✅ Initialization complete!")
+        click.echo("\nNext steps:")
+        click.echo("   1. Edit .env and add your API keys")
+        click.echo("   2. Run 'python cli.py status' to check system status")
+        click.echo("   3. Run 'python cli.py server' to start the API server")
+        
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}", exc_info=True)
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
 
