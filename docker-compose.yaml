@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # Main API service
+  api:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: berlin-archive-api
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - VECTORSTORE_TYPE=chroma
+      - VECTORSTORE_PATH=/app/data/vectorstore
+      - ENABLE_SPEAKER_DIARIZATION=true
+      - ENABLE_HYBRID_SEARCH=true
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    networks:
+      - berlin-network
+
+  # PostgreSQL database (optional, for production-grade vector store)
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: berlin-archive-db
+    environment:
+      - POSTGRES_DB=berlin_archive
+      - POSTGRES_USER=archive_user
+      - POSTGRES_PASSWORD=archive_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - berlin-network
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: berlin-archive-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - berlin-network
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: berlin-archive-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - berlin-network
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  berlin-network:
+    driver: bridge
