@@ -3,14 +3,18 @@ RAG Evaluator Module
 Comprehensive evaluation system for RAG responses.
 """
 
-from rag_evaluator import ComprehensiveEvaluation
-from rag_evaluator import BatchEvaluationResult, EvaluationResult, MetricType
-from .llm_rag_evaluator import LLMRAGEvaluator
+from .llm_rag_evaluator import (
+    LLMRAGEvaluator,
+    ComprehensiveEvaluation,
+    BatchEvaluationResult,
+    MetricType,
+    EvaluationResult
+)
 
 __all__ = [
+    "LLMRAGEvaluator",
     "ComprehensiveEvaluation",
     "BatchEvaluationResult",
-    "EvaluationResult",
     "MetricType",
-    "LLMRAGEvaluator"
+    "EvaluationResult"
 ]

@@ -143,7 +143,7 @@ class LLMRAGEvaluator:
     
     def __init__(
         self,
-        model: str = "gpt-5.1-codex-001",
+        model: str = "gpt-4-turbo-preview",
         temperature: float = 0.0,
         api_key: Optional[str] = None
     ):

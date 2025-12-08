@@ -3,22 +3,20 @@ API Router
 FastAPI endpoints for the Berlin Media Archive.
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Query, Form
 from fastapi.responses import JSONResponse
 from typing import Optional, List
 from pydantic import BaseModel, Field
-from pathlib import Path
+from loguru import logger
+import os
 import shutil
-from datetime import datetime
+from pathlib import Path
 
-import logging
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
+from ingestion.audio_ingestion import AudioIngestionPipeline
+from ingestion.document_ingestion import DocumentIngestionPipeline
 from pipeline.orchestrator import BerlinArchivePipeline
+from rag.attribution_engine import AttributionEngine
 from utils.config import settings
-from rag_evaluator.llm_rag_evaluator import LLMRAGEvaluator
 
 # Initialize router
 router = APIRouter(prefix="/api/v1", tags=["Berlin Archive"])
@@ -26,8 +24,7 @@ router = APIRouter(prefix="/api/v1", tags=["Berlin Archive"])
 # Global pipeline instance
 pipeline: Optional[BerlinArchivePipeline] = None
 
-
-# Pydantic Models
+# Request/Response Models
 class QueryRequest(BaseModel):
     """Request model for archive queries."""
     question: str = Field(..., description="The question to ask the archive")
@@ -46,6 +43,7 @@ class QueryResponse(BaseModel):
     num_citations: int
     num_chunks_retrieved: int
     timestamp: str
+
 
 class EvaluationRequest(BaseModel):
     question: str
@@ -77,6 +75,24 @@ class IngestResponse(BaseModel):
     filename: str
     items_added: int
     metadata: dict
+
+
+class StatusResponse(BaseModel):
+    """Status response."""
+    status: str
+    components: dict
+    configuration: dict
+
+
+# Initialize components
+try:
+    orchestrator = BerlinArchivePipeline()
+    attribution_engine = AttributionEngine(vector_store=orchestrator.vector_store)
+    logger.info("API components initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing API components: {e}")
+    orchestrator = None
+    attribution_engine = None
 
 
 # Startup/Shutdown Events
@@ -166,8 +182,10 @@ async def query_archive(request: QueryRequest):
 # Audio Upload Endpoint
 @router.post("/ingest/audio", response_model=IngestResponse)
 async def ingest_audio(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Audio file to ingest"),
-    save_transcription: bool = Form(True, description="Save transcription to disk")
+    save_transcription: bool = Form(True, description="Save transcription to disk"),
+    enable_diarization: bool = Query(default=True)
 ):
     """
     Ingest an audio file into the archive.
@@ -180,7 +198,7 @@ async def ingest_audio(
     
     try:
         # Validate file type
-        if not file.filename.lower().endswith(('.mp3', '.wav')):
+        if not file.filename or not file.filename.lower().endswith(('.mp3', '.wav')):
             raise HTTPException(status_code=400, detail="Only MP3 and WAV files are supported")
         
         # Save uploaded file
@@ -190,21 +208,28 @@ async def ingest_audio(
         
         logger.info(f"Uploaded audio file: {file.filename}")
         
-        # Process audio
-        segments, metadata = pipeline.ingest_audio_file(
-            str(audio_path),
-            save_transcription=save_transcription
-        )
+        # Process audio in background
+        def process_audio_task():
+            try:
+                audio_ingestion = AudioIngestionPipeline(enable_diarization=enable_diarization)
+                output_dir = os.path.join(settings.output_dir, "audio")
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                audio_ingestion.ingest_audio(str(audio_path), output_dir)
+                logger.info(f"Audio processing complete: {file.filename}")
+            except Exception as e:
+                logger.error(f"Background audio processing failed: {e}")
+        
+        background_tasks.add_task(process_audio_task)
         
         return IngestResponse(
             success=True,
             message="Audio file ingested successfully",
             filename=file.filename,
-            items_added=len(segments),
+            items_added=0,
             metadata={
-                "duration_seconds": metadata.get("duration_seconds", 0),
-                "num_segments": len(segments),
-                "has_diarization": any(s.speaker for s in segments)
+                "duration_seconds": 0,
+                "num_segments": 0,
+                "has_diarization": False
             }
         )
         
@@ -216,6 +241,7 @@ async def ingest_audio(
 # Document Upload Endpoint
 @router.post("/ingest/document", response_model=IngestResponse)
 async def ingest_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="PDF document to ingest"),
     save_chunks: bool = Form(True, description="Save chunks to disk")
 ):
@@ -229,7 +255,7 @@ async def ingest_document(
     
     try:
         # Validate file type
-        if not file.filename.lower().endswith('.pdf'):
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
         
         # Save uploaded file
@@ -239,22 +265,29 @@ async def ingest_document(
         
         logger.info(f"Uploaded document: {file.filename}")
         
-        # Process document
-        chunks, metadata = pipeline.ingest_document_file(
-            str(doc_path),
-            save_chunks=save_chunks
-        )
+        # Process document in background
+        def process_document_task():
+            try:
+                document_ingestion = DocumentIngestionPipeline()
+                output_dir = os.path.join(settings.output_dir, "documents")
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                document_ingestion.ingest_document(str(doc_path), output_dir)
+                logger.info(f"Document processing complete: {file.filename}")
+            except Exception as e:
+                logger.error(f"Background document processing failed: {e}")
+        
+        background_tasks.add_task(process_document_task)
         
         return IngestResponse(
             success=True,
             message="Document ingested successfully",
             filename=file.filename,
-            items_added=len(chunks),
+            items_added=0,
             metadata={
-                "num_pages": metadata.get("num_pages", 0),
-                "num_chunks": len(chunks),
-                "title": metadata.get("title", ""),
-                "author": metadata.get("author", "")
+                "num_pages": 0,
+                "num_chunks": 0,
+                "title": "",
+                "author": ""
             }
         )
         
@@ -425,7 +458,7 @@ async def reset_collection(confirm: bool = Query(False, description="Must be tru
     except Exception as e:
         logger.error(f"Reset operation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Reset operation failed: {str(e)}")
-    
+
 
 # RAG Evaluation Endpoint
 @router.post("/evaluate")
@@ -441,6 +474,7 @@ async def evaluate_response(request: EvaluationRequest):
     try:
         logger.info("Evaluating response")
         
+        from rag_evaluator import LLMRAGEvaluator
         evaluator = LLMRAGEvaluator()
         result = evaluator.evaluate_response(
             question=request.question,
@@ -448,9 +482,40 @@ async def evaluate_response(request: EvaluationRequest):
             retrieved_context=request.context,
             ground_truth=request.ground_truth
         )
-        
         return result.to_dict()
         
     except Exception as e:
         logger.error(f"Evaluation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/status", response_model=StatusResponse)
+async def get_status():
+    """Get system status"""
+    try:
+        components_status = {
+            "orchestrator": "ready" if orchestrator else "not_initialized",
+            "attribution_engine": "ready" if attribution_engine else "not_initialized",
+        }
+        
+        configuration = {
+            "llm_model": os.getenv("LLM_MODEL", "gpt-4-turbo-preview"),
+            "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"),
+            "whisper_model": os.getenv("WHISPER_MODEL", "base"),
+            "vector_store": os.getenv("VECTORSTORE_TYPE", "chroma"),
+            "hybrid_search": os.getenv("ENABLE_HYBRID_SEARCH", "true"),
+            "speaker_diarization": os.getenv("ENABLE_DIARIZATION", "true"),
+        }
+        
+        overall_status = "operational" if all(
+            v == "ready" for v in components_status.values()
+        ) else "degraded"
+        
+        return StatusResponse(
+            status=overall_status,
+            components=components_status,
+            configuration=configuration
+        )
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
         raise HTTPException(status_code=500, detail=str(e))

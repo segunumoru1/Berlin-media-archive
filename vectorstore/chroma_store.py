@@ -6,7 +6,7 @@ Uses OpenAI embeddings.
 
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Literal, cast
+from typing import List, Dict, Optional, Any, Literal
 from datetime import datetime
 
 import chromadb
@@ -15,6 +15,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Try to import settings
+try:
+    from utils.config import settings
+    USE_SETTINGS = True
+except ImportError:
+    USE_SETTINGS = False
 
 from embeddings.openai_embeddings import OpenAIEmbeddings
 from ingestion.audio_ingestion import TranscriptSegment
@@ -39,8 +46,13 @@ class UnifiedVectorStore:
             persist_directory: Directory to persist the database
             embedding_model: OpenAI embedding model to use
         """
-        self.collection_name = collection_name or settings.collection_name
-        self.persist_directory = persist_directory or settings.vectorstore_path
+        
+        if USE_SETTINGS:
+            self.collection_name = collection_name or settings.collection_name
+            self.persist_directory = persist_directory or settings.vectorstore_path
+        else:
+            self.collection_name = collection_name or "default_collection"
+            self.persist_directory = persist_directory or "./data/vectorstore"
         
         logger.info(f"Initializing UnifiedVectorStore: {self.collection_name}")
         logger.info(f"Persist directory: {self.persist_directory}")
@@ -49,19 +61,30 @@ class UnifiedVectorStore:
         Path(self.persist_directory).mkdir(parents=True, exist_ok=True)
         
         # Initialize OpenAI embeddings
-        embedding_model = embedding_model or settings.embedding_model
-        self.embeddings = OpenAIEmbeddings(model=embedding_model)
+        try:
+            if USE_SETTINGS:
+                embedding_model = embedding_model or settings.embedding_model
+            else:
+                embedding_model = embedding_model or "text-embedding-3-large"
+            self.embeddings = OpenAIEmbeddings(model=embedding_model)
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI embeddings: {e}")
+            raise
         
         logger.info(f"Using embedding model: {self.embeddings.model}")
         
         # Initialize ChromaDB client
-        self.client = chromadb.PersistentClient(
-            path=self.persist_directory,
-            settings=Settings(
-                anonymized_telemetry=False,
-                allow_reset=True
+        try:
+            self.client = chromadb.PersistentClient(
+                path=self.persist_directory,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
             )
         )
+        except Exception as e:
+            logger.error(f"Failed to initialize ChromaDB client: {e}")
+            raise
         
         # Get or create collection
         try:

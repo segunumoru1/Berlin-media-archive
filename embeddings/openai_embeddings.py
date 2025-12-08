@@ -9,45 +9,70 @@ from typing import List, Optional, Union
 import numpy as np
 from openai import OpenAI
 import logging
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+load_dotenv()
+
+
+# Try to import settings, fallback to os.getenv
+try:
+    from utils.config import settings
+    USE_SETTINGS = True
+except ImportError:
+    USE_SETTINGS = False
+    logger.warning("Could not import settings, using environment variables directly")
+
 
 class OpenAIEmbeddings:
-    """
-    OpenAI embeddings service for all text content.
-    Handles both document chunks and audio transcripts.
-    """
+    """OpenAI embeddings with caching support"""
     
     def __init__(
         self,
-        model: str = "text-embedding-3-large",
-        api_key: Optional[str] = None,
-        batch_size: int = 100
+        model: Optional[str] = None,
+        api_key: Optional[str] = None
     ):
-        """
-        Initialize OpenAI embeddings.
+        # Get API key
+        if api_key:
+            self.api_key = api_key
+        elif USE_SETTINGS:
+            self.api_key = settings.openai_api_key
+        else:
+            self.api_key = os.getenv("OPENAI_API_KEY")
         
-        Args:
-            model: OpenAI embedding model (text-embedding-3-large or text-embedding-ada-002)
-            api_key: OpenAI API key (or use env variable)
-            batch_size: Number of texts to embed in one batch
-        """
-        self.model = model
-        self.batch_size = batch_size
+        if not self.api_key or self.api_key == "your_openai_key_here":
+            raise ValueError(
+                "OPENAI_API_KEY not found in environment. "
+                "Please set it in your .env file."
+            )
         
-        # Initialize OpenAI client
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment")
+        # Get model
+        if model:
+            self.model = model
+        elif USE_SETTINGS:
+            self.model = settings.embedding_model
+        else:
+            self.model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
         
-        self.client = OpenAI(api_key=api_key)
+        # Initialize client
+        self.client = OpenAI(api_key=self.api_key)
         
-        # Get embedding dimensions
-        self.dimensions = 3072 if "large" in model else 1536
+        # Set dimensions based on model
+        if "text-embedding-3-large" in self.model:
+            self.dimensions = 3072
+        elif "text-embedding-3-small" in self.model:
+            self.dimensions = 1536
+        elif "text-embedding-ada-002" in self.model:
+            self.dimensions = 1536
+        else:
+            self.dimensions = 1536  # Default
         
-        logger.info(f"OpenAIEmbeddings initialized with model: {model} ({self.dimensions}D)")
+        # Set batch size for batch processing
+        self.batch_size = 100
+        
+        logger.info(f"OpenAI Embeddings initialized with model: {self.model}")
     
     def embed_text(self, text: str) -> List[float]:
         """
