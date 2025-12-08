@@ -149,8 +149,8 @@ Be conversational but precise. Combine information from multiple sources when re
             logger.info("Step 1: Retrieving relevant chunks...")
             retrieved_chunks = self._retrieve_chunks(
                 question,
-                n_results=n_results,
-                filter_metadata=filter_metadata
+                top_k=n_results if n_results is not None else 5,
+                filters=filter_metadata
             )
             
             if not retrieved_chunks:
@@ -195,47 +195,34 @@ Be conversational but precise. Combine information from multiple sources when re
             raise
     
     def _retrieve_chunks(
-        self,
-        query: str,
-        n_results: Optional[int] = None,
-        filter_metadata: Optional[Dict] = None
-    ) -> List[Dict[str, Any]]:
+    self,
+    query: str,
+    top_k: int = 5,
+    filters: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
         """
         Retrieve relevant chunks from vector store.
         
         Args:
             query: Search query
-            n_results: Number of results
-            filter_metadata: Optional filters
+            top_k: Number of results
+            filters: Optional filters
             
         Returns:
-            List of retrieved chunks with metadata
+            List of retrieved chunks
         """
-        n_results = n_results or settings.top_k_results
-        
         try:
-            if self.use_hybrid_search:
-                logger.debug("Using hybrid search")
-                results = self.vector_store.hybrid_search(
-                    query=query,
-                    n_results=n_results,
-                    filter_metadata=filter_metadata,
-                    semantic_weight=1 - settings.bm25_weight
-                )
-            else:
-                logger.debug("Using semantic search")
-                raw_results = self.vector_store.search(
-                    query=query,
-                    n_results=n_results,
-                    filter_metadata=filter_metadata
-                )
-                results = self.vector_store._format_search_results(raw_results)
+            results = self.vector_store.search(
+                query=query,
+                top_k=top_k,
+                filters=filters
+            )
             
             return results
             
         except Exception as e:
             logger.error(f"Chunk retrieval failed: {e}")
-            raise
+            return []
     
     def _build_context(self, chunks: List[Dict[str, Any]]) -> str:
         """

@@ -1,406 +1,396 @@
 """
 Document Ingestion Pipeline
-Handles PDF and document processing with intelligent chunking and metadata extraction.
+Handles PDF and DOCX processing with intelligent chunking.
 """
 
 import os
+import json
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Union
-from dataclasses import dataclass, asdict
-import hashlib
-
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-import logging
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-from utils.config import settings
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from loguru import logger
 
 
 @dataclass
 class DocumentChunk:
-    """Represents a single document chunk with metadata."""
-    text: str
+    """Represents a chunk of document text."""
+    chunk_id: str
+    content: str
     page_number: int
-    chunk_index: int
-    source: str
-    metadata: Dict
-    chunk_id: Optional[str] = None
+    source_file: str
+    char_start: int
+    char_end: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
-    def __post_init__(self):
-        """Generate unique chunk ID after initialization."""
-        if not self.chunk_id:
-            self.chunk_id = self._generate_chunk_id()
-    
-    def _generate_chunk_id(self) -> str:
-        """Generate unique chunk ID based on content and metadata."""
-        content = f"{self.source}_{self.page_number}_{self.chunk_index}_{self.text[:100]}"
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary."""
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-    
-    def get_citation(self) -> str:
-        """Get formatted citation string."""
-        filename = Path(self.source).name
-        return f"Source: {filename}, Page {self.page_number}"
 
 
 class DocumentIngestionPipeline:
-    """Pipeline for ingesting and processing documents."""
+    """
+    Production-grade document ingestion pipeline.
+    Supports PDF and DOCX files with intelligent chunking.
+    """
     
     def __init__(
         self,
-        chunk_size: Optional[int] = None,
-        chunk_overlap: Optional[int] = None
+        chunk_size: int = None,
+        chunk_overlap: int = None
     ):
         """
         Initialize document ingestion pipeline.
         
         Args:
-            chunk_size: Size of text chunks in characters
-            chunk_overlap: Overlap between chunks in characters
+            chunk_size: Maximum chunk size in characters
+            chunk_overlap: Overlap between chunks
         """
-        self.chunk_size = chunk_size or settings.chunk_size
-        self.chunk_overlap = chunk_overlap or settings.chunk_overlap
+        self.chunk_size = chunk_size or int(os.getenv("CHUNK_SIZE", "1000"))
+        self.chunk_overlap = chunk_overlap or int(os.getenv("CHUNK_OVERLAP", "200"))
         
-        logger.info(f"Initializing DocumentIngestionPipeline")
-        logger.info(f"Chunk size: {self.chunk_size}, Overlap: {self.chunk_overlap}")
+        # Check for PDF libraries
+        self.pdf_library = None
+        try:
+            import pdfplumber
+            self.pdf_library = "pdfplumber"
+            logger.info("Using pdfplumber for PDF extraction")
+        except ImportError:
+            try:
+                from pypdf import PdfReader
+                self.pdf_library = "pypdf"
+                logger.info("Using pypdf for PDF extraction")
+            except ImportError:
+                try:
+                    from PyPDF2 import PdfReader
+                    self.pdf_library = "PyPDF2"
+                    logger.info("Using PyPDF2 for PDF extraction")
+                except ImportError:
+                    logger.warning("No PDF library available. Install pdfplumber, pypdf, or PyPDF2")
         
-        # Initialize text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""],
-            is_separator_regex=False
-        )
+        logger.info(f"Document ingestion pipeline initialized (chunk_size={self.chunk_size}, overlap={self.chunk_overlap})")
     
     def ingest_document(
         self,
-        document_path: Union[str, Path],
+        file_path: str,
         output_dir: Optional[str] = None
-    ) -> Tuple[List[DocumentChunk], Dict]:
+    ) -> Tuple[List[DocumentChunk], Dict[str, Any]]:
         """
-        Ingest and process a document file.
+        Ingest a document file.
         
         Args:
-            document_path: Path to document file (PDF)
-            output_dir: Optional directory to save processing results
+            file_path: Path to the document file
+            output_dir: Directory to save processed chunks
             
         Returns:
-            Tuple of (document_chunks, metadata)
+            Tuple of (list of chunks, metadata dict)
         """
-        try:
-            document_path = Path(document_path)
-            logger.info(f"Ingesting document: {document_path}")
+        file_path = Path(file_path)
+        logger.info(f"Ingesting document: {file_path.name}")
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"Document not found: {file_path}")
+        
+        # Extract text based on file type
+        suffix = file_path.suffix.lower()
+        
+        if suffix == ".pdf":
+            pages, metadata = self.extract_text_from_pdf(str(file_path))
+        elif suffix in [".docx", ".doc"]:
+            pages, metadata = self.extract_text_from_docx(str(file_path))
+        elif suffix == ".txt":
+            pages, metadata = self.extract_text_from_txt(str(file_path))
+        else:
+            raise ValueError(f"Unsupported file type: {suffix}")
+        
+        # Create chunks
+        chunks = self.create_chunks(pages, str(file_path), metadata)
+        
+        # Update metadata
+        metadata["num_chunks"] = len(chunks)
+        metadata["source_file"] = file_path.name
+        
+        # Save chunks if output directory specified
+        if output_dir:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Validate file exists
-            if not document_path.exists():
-                raise FileNotFoundError(f"Document not found: {document_path}")
+            output_file = output_dir / f"{file_path.stem}_chunks.json"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump([chunk.to_dict() for chunk in chunks], f, indent=2, ensure_ascii=False)
             
-            # Validate file type
-            if document_path.suffix.lower() != '.pdf':
-                raise ValueError(f"Unsupported file type: {document_path.suffix}")
-            
-            # Extract text from PDF
-            logger.info("Extracting text from PDF...")
-            pages_text, metadata = self._extract_pdf_text(document_path)
-            
-            # Process and chunk the text
-            logger.info("Chunking document text...")
-            chunks = self._chunk_document(pages_text, document_path, metadata)
-            
-            logger.info(f"Created {len(chunks)} document chunks")
-            
-            # Save results if output directory specified
-            if output_dir:
-                self._save_results(document_path, chunks, metadata, output_dir)
-            
-            logger.info("Document ingestion completed successfully")
-            return chunks, metadata
-            
-        except Exception as e:
-            logger.error(f"Document ingestion failed: {e}", exc_info=True)
-            raise
+            logger.info(f"Saved {len(chunks)} chunks to {output_file}")
+        
+        return chunks, metadata
     
-    def _extract_pdf_text(self, pdf_path: Path) -> Tuple[List[Dict], Dict]:
+    def extract_text_from_pdf(self, file_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Extract text from PDF file page by page.
+        Extract text from PDF file with metadata.
         
         Args:
-            pdf_path: Path to PDF file
+            file_path: Path to PDF file
             
         Returns:
-            Tuple of (pages_text, metadata)
+            Tuple of (list of page dicts, metadata dict)
         """
-        try:
-            reader = PdfReader(str(pdf_path))
+        pages = []
+        metadata = {
+            "title": "",
+            "author": "",
+            "num_pages": 0,
+            "file_type": "pdf"
+        }
+        
+        if self.pdf_library == "pdfplumber":
+            import pdfplumber
+            
+            with pdfplumber.open(file_path) as pdf:
+                metadata["num_pages"] = len(pdf.pages)
+                
+                # Extract metadata from PDF info
+                if pdf.metadata:
+                    metadata["title"] = pdf.metadata.get("Title", "") or ""
+                    metadata["author"] = pdf.metadata.get("Author", "") or ""
+                    metadata["creator"] = pdf.metadata.get("Creator", "") or ""
+                    metadata["producer"] = pdf.metadata.get("Producer", "") or ""
+                
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    
+                    # Try to extract title from first page if not in metadata
+                    if i == 0 and not metadata["title"]:
+                        metadata["title"] = self._extract_title_from_text(text)
+                    
+                    pages.append({
+                        "page_number": i + 1,
+                        "text": text,
+                        "char_count": len(text)
+                    })
+        
+        elif self.pdf_library in ["pypdf", "PyPDF2"]:
+            if self.pdf_library == "pypdf":
+                from pypdf import PdfReader
+            else:
+                from PyPDF2 import PdfReader
+            
+            reader = PdfReader(file_path)
+            metadata["num_pages"] = len(reader.pages)
             
             # Extract metadata
-            metadata = {
-                "filename": pdf_path.name,
-                "filepath": str(pdf_path),
-                "num_pages": len(reader.pages),
-                "file_size_mb": pdf_path.stat().st_size / (1024 * 1024),
-            }
-            
-            # Try to extract PDF metadata
             if reader.metadata:
-                pdf_info = reader.metadata
-                metadata.update({
-                    "title": pdf_info.get("/Title", ""),
-                    "author": pdf_info.get("/Author", ""),
-                    "subject": pdf_info.get("/Subject", ""),
-                    "creator": pdf_info.get("/Creator", ""),
-                    "producer": pdf_info.get("/Producer", ""),
-                    "creation_date": str(pdf_info.get("/CreationDate", "")),
+                metadata["title"] = reader.metadata.get("/Title", "") or ""
+                metadata["author"] = reader.metadata.get("/Author", "") or ""
+                metadata["creator"] = reader.metadata.get("/Creator", "") or ""
+            
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                
+                # Try to extract title from first page if not in metadata
+                if i == 0 and not metadata["title"]:
+                    metadata["title"] = self._extract_title_from_text(text)
+                
+                pages.append({
+                    "page_number": i + 1,
+                    "text": text,
+                    "char_count": len(text)
                 })
-            
-            # Extract text page by page
-            pages_text = []
-            for page_num, page in enumerate(reader.pages, start=1):
-                try:
-                    text = page.extract_text()
-                    
-                    # Clean extracted text
-                    text = self._clean_text(text)
-                    
-                    if text.strip():  # Only add non-empty pages
-                        pages_text.append({
-                            "page_number": page_num,
-                            "text": text,
-                            "char_count": len(text)
-                        })
-                        logger.debug(f"Extracted page {page_num}: {len(text)} characters")
-                    else:
-                        logger.warning(f"Page {page_num} is empty or could not be extracted")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to extract text from page {page_num}: {e}")
-                    continue
-            
-            if not pages_text:
-                raise ValueError("No text could be extracted from PDF")
-            
-            logger.info(f"Extracted text from {len(pages_text)} pages")
-            return pages_text, metadata
-            
-        except Exception as e:
-            logger.error(f"PDF text extraction failed: {e}")
-            raise
+        
+        else:
+            raise RuntimeError("No PDF library available")
+        
+        total_chars = sum(p["char_count"] for p in pages)
+        logger.info(f"Extracted {len(pages)} pages, {total_chars} total characters")
+        
+        # If still no title, use filename
+        if not metadata["title"]:
+            metadata["title"] = Path(file_path).stem.replace("_", " ").replace("-", " ")
+        
+        return pages, metadata
     
-    def _clean_text(self, text: str) -> str:
+    def _extract_title_from_text(self, text: str) -> str:
         """
-        Clean extracted text.
+        Try to extract title from first page text.
         
         Args:
-            text: Raw extracted text
+            text: First page text
             
         Returns:
-            Cleaned text
+            Extracted title or empty string
         """
-        # Remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text)
+        if not text:
+            return ""
         
-        # Remove page numbers at start/end of lines (common pattern)
-        text = re.sub(r'^\d+\s*$', '', text, flags=re.MULTILINE)
+        lines = text.strip().split("\n")
         
-        # Remove excessive newlines
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        # Filter and clean lines
+        clean_lines = []
+        for line in lines[:10]:  # Check first 10 lines
+            line = line.strip()
+            if len(line) > 5 and len(line) < 200:  # Reasonable title length
+                # Skip lines that look like headers/footers
+                if not re.match(r'^(page|chapter|\d+|www\.|http|©)', line.lower()):
+                    clean_lines.append(line)
         
-        # Strip leading/trailing whitespace
-        text = text.strip()
+        if clean_lines:
+            # Return first substantial line as title
+            return clean_lines[0]
         
-        return text
+        return ""
     
-    def _chunk_document(
-        self,
-        pages_text: List[Dict],
-        document_path: Path,
-        document_metadata: Dict
-    ) -> List[DocumentChunk]:
+    def extract_text_from_docx(self, file_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Chunk document text intelligently.
+        Extract text from DOCX file.
         
         Args:
-            pages_text: List of page text dictionaries
-            document_path: Path to original document
-            document_metadata: Document metadata
+            file_path: Path to DOCX file
+            
+        Returns:
+            Tuple of (list of page dicts, metadata dict)
+        """
+        try:
+            from docx import Document
+        except ImportError:
+            raise RuntimeError("python-docx not installed. Run: pip install python-docx")
+        
+        doc = Document(file_path)
+        
+        # Extract metadata
+        core_props = doc.core_properties
+        metadata = {
+            "title": core_props.title or Path(file_path).stem,
+            "author": core_props.author or "",
+            "num_pages": 1,  # DOCX doesn't have page concept
+            "file_type": "docx"
+        }
+        
+        # Extract all paragraphs
+        full_text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        
+        pages = [{
+            "page_number": 1,
+            "text": full_text,
+            "char_count": len(full_text)
+        }]
+        
+        logger.info(f"Extracted {len(full_text)} characters from DOCX")
+        
+        return pages, metadata
+    
+    def extract_text_from_txt(self, file_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Extract text from TXT file.
+        
+        Args:
+            file_path: Path to TXT file
+            
+        Returns:
+            Tuple of (list of page dicts, metadata dict)
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        
+        metadata = {
+            "title": Path(file_path).stem,
+            "author": "",
+            "num_pages": 1,
+            "file_type": "txt"
+        }
+        
+        pages = [{
+            "page_number": 1,
+            "text": text,
+            "char_count": len(text)
+        }]
+        
+        return pages, metadata
+    
+    def create_chunks(
+        self,
+        pages: List[Dict[str, Any]],
+        source_file: str,
+        metadata: Dict[str, Any]
+    ) -> List[DocumentChunk]:
+        """
+        Create overlapping chunks from pages.
+        
+        Args:
+            pages: List of page dicts with text
+            source_file: Source file path
+            metadata: Document metadata
             
         Returns:
             List of DocumentChunk objects
         """
         chunks = []
+        chunk_id = 0
         
-        for page_data in pages_text:
-            page_number = page_data["page_number"]
-            page_text = page_data["text"]
+        for page in pages:
+            page_text = page["text"]
+            page_number = page["page_number"]
             
-            # Split page text into chunks
-            text_chunks = self.text_splitter.split_text(page_text)
+            if not page_text.strip():
+                continue
             
-            # Create DocumentChunk objects
-            for chunk_idx, chunk_text in enumerate(text_chunks):
-                # Prepare metadata
-                chunk_metadata = {
-                    "document_name": document_metadata["filename"],
-                    "total_pages": document_metadata["num_pages"],
-                    "char_count": len(chunk_text),
-                    "word_count": len(chunk_text.split()),
-                    "chunks_on_page": len(text_chunks),
-                }
-                
-                # Add optional metadata if available
-                if "title" in document_metadata and document_metadata["title"]:
-                    chunk_metadata["document_title"] = document_metadata["title"]
-                if "author" in document_metadata and document_metadata["author"]:
-                    chunk_metadata["document_author"] = document_metadata["author"]
-                
+            # Split into sentences for better chunking
+            sentences = self._split_into_sentences(page_text)
+            
+            current_chunk = ""
+            char_start = 0
+            
+            for sentence in sentences:
+                # If adding sentence exceeds chunk size, save current chunk
+                if len(current_chunk) + len(sentence) > self.chunk_size and current_chunk:
+                    chunk = DocumentChunk(
+                        chunk_id=f"chunk_{chunk_id}",
+                        content=current_chunk.strip(),
+                        page_number=page_number,
+                        source_file=Path(source_file).name,
+                        char_start=char_start,
+                        char_end=char_start + len(current_chunk),
+                        metadata={
+                            "title": metadata.get("title", ""),
+                            "author": metadata.get("author", "")
+                        }
+                    )
+                    chunks.append(chunk)
+                    chunk_id += 1
+                    
+                    # Start new chunk with overlap
+                    overlap_start = max(0, len(current_chunk) - self.chunk_overlap)
+                    current_chunk = current_chunk[overlap_start:] + sentence
+                    char_start = char_start + overlap_start
+                else:
+                    current_chunk += sentence
+            
+            # Add remaining text as final chunk for this page
+            if current_chunk.strip():
                 chunk = DocumentChunk(
-                    text=chunk_text,
+                    chunk_id=f"chunk_{chunk_id}",
+                    content=current_chunk.strip(),
                     page_number=page_number,
-                    chunk_index=chunk_idx,
-                    source=str(document_path),
-                    metadata=chunk_metadata
+                    source_file=Path(source_file).name,
+                    char_start=char_start,
+                    char_end=char_start + len(current_chunk),
+                    metadata={
+                        "title": metadata.get("title", ""),
+                        "author": metadata.get("author", "")
+                    }
                 )
-                
                 chunks.append(chunk)
+                chunk_id += 1
         
+        logger.info(f"Created {len(chunks)} chunks from {len(pages)} pages")
         return chunks
     
-    def _save_results(
-        self,
-        document_path: Path,
-        chunks: List[DocumentChunk],
-        metadata: Dict,
-        output_dir: str
-    ):
+    def _split_into_sentences(self, text: str) -> List[str]:
         """
-        Save processing results to files.
+        Split text into sentences.
         
         Args:
-            document_path: Original document path
-            chunks: Document chunks
-            metadata: Document metadata
-            output_dir: Output directory
-        """
-        try:
-            import json
-            
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            base_name = document_path.stem
-            
-            # Save JSON with full details
-            json_path = output_path / f"{base_name}_chunks.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "metadata": metadata,
-                    "chunks": [chunk.to_dict() for chunk in chunks],
-                    "statistics": {
-                        "total_chunks": len(chunks),
-                        "avg_chunk_size": sum(len(c.text) for c in chunks) / len(chunks),
-                        "pages_processed": metadata["num_pages"]
-                    }
-                }, f, indent=2, ensure_ascii=False)
-            
-            logger.info(f"Saved JSON chunks: {json_path}")
-            
-            # Save human-readable text
-            txt_path = output_path / f"{base_name}_chunks.txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"Document: {document_path.name}\n")
-                f.write(f"Pages: {metadata['num_pages']}\n")
-                f.write(f"Total Chunks: {len(chunks)}\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for chunk in chunks:
-                    f.write(f"--- Chunk {chunk.chunk_id} ---\n")
-                    f.write(f"Page: {chunk.page_number}, Chunk Index: {chunk.chunk_index}\n")
-                    f.write(f"Text Length: {len(chunk.text)} characters\n")
-                    f.write(f"{chunk.text}\n")
-                    f.write("\n" + "=" * 80 + "\n\n")
-            
-            logger.info(f"Saved text chunks: {txt_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to save results: {e}")
-    
-    def batch_ingest_documents(
-        self,
-        document_dir: Union[str, Path],
-        output_dir: Optional[str] = None,
-        file_pattern: str = "*.pdf"
-    ) -> Dict[str, Tuple[List[DocumentChunk], Dict]]:
-        """
-        Batch process multiple documents from a directory.
-        
-        Args:
-            document_dir: Directory containing documents
-            output_dir: Optional output directory
-            file_pattern: File pattern to match (default: *.pdf)
+            text: Input text
             
         Returns:
-            Dictionary mapping filenames to (chunks, metadata) tuples
+            List of sentences
         """
-        document_dir = Path(document_dir)
-        results = {}
-        
-        # Find all matching documents
-        documents = list(document_dir.glob(file_pattern))
-        logger.info(f"Found {len(documents)} documents to process")
-        
-        for doc_path in documents:
-            try:
-                logger.info(f"Processing document: {doc_path.name}")
-                chunks, metadata = self.ingest_document(doc_path, output_dir)
-                results[doc_path.name] = (chunks, metadata)
-                logger.info(f"Successfully processed: {doc_path.name}")
-            except Exception as e:
-                logger.error(f"Failed to process {doc_path.name}: {e}")
-                continue
-        
-        logger.info(f"Batch processing complete. Processed {len(results)}/{len(documents)} documents")
-        return results
-
-
-def ingest_document_file(
-    document_path: Union[str, Path],
-    output_dir: Optional[str] = None
-) -> Tuple[List[DocumentChunk], Dict]:
-    """
-    Convenience function to ingest a single document file.
-    
-    Args:
-        document_path: Path to document file
-        output_dir: Optional output directory
-        
-    Returns:
-        Tuple of (chunks, metadata)
-    """
-    pipeline = DocumentIngestionPipeline()
-    return pipeline.ingest_document(document_path, output_dir)
-
-
-def batch_ingest_documents(
-    document_dir: Union[str, Path],
-    output_dir: Optional[str] = None
-) -> Dict[str, Tuple[List[DocumentChunk], Dict]]:
-    """
-    Convenience function to batch ingest documents from a directory.
-    
-    Args:
-        document_dir: Directory containing documents
-        output_dir: Optional output directory
-        
-    Returns:
-        Dictionary mapping filenames to (chunks, metadata) tuples
-    """
-    pipeline = DocumentIngestionPipeline()
-    return pipeline.batch_ingest_documents(document_dir, output_dir)
+        # Simple sentence splitting
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s for s in sentences if s.strip()]

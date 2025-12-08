@@ -1,543 +1,423 @@
 """
-ChromaDB Vector Store
-Unified vector store for audio and document chunks with hybrid search support.
-Uses OpenAI embeddings.
+Unified Vector Store with ChromaDB
+Handles both audio and document embeddings with hybrid search support.
 """
 
+import os
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Literal
-from datetime import datetime
-
+from typing import List, Dict, Any, Optional, Tuple
+from loguru import logger
 import chromadb
-from chromadb.config import Settings
-import logging
+from chromadb.config import Settings as ChromaSettings
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# Try to import settings
+# Try to import BM25 for hybrid search
 try:
-    from utils.config import settings
-    USE_SETTINGS = True
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
 except ImportError:
-    USE_SETTINGS = False
-
-from embeddings.openai_embeddings import OpenAIEmbeddings
-from ingestion.audio_ingestion import TranscriptSegment
-from ingestion.document_ingestion import DocumentChunk
-from utils.config import settings
+    BM25_AVAILABLE = False
+    logger.warning("rank_bm25 not installed. Hybrid search will use semantic only.")
 
 
 class UnifiedVectorStore:
-    """Unified vector store for multi-modal content using ChromaDB."""
+    """
+    Unified vector store for audio transcripts and documents.
+    Supports hybrid search combining dense embeddings with BM25.
+    """
     
     def __init__(
         self,
-        collection_name: Optional[str] = None,
         persist_directory: Optional[str] = None,
-        embedding_model: Optional[str] = None
+        collection_name: Optional[str] = None
     ):
         """
-        Initialize unified vector store.
+        Initialize the unified vector store.
         
         Args:
+            persist_directory: Directory to persist ChromaDB data
             collection_name: Name of the collection
-            persist_directory: Directory to persist the database
-            embedding_model: OpenAI embedding model to use
         """
+        self.persist_directory = persist_directory or os.getenv("VECTORSTORE_PATH", "./data/vectorstore")
+        self.collection_name = collection_name or os.getenv("COLLECTION_NAME", "berlin_archive")
         
-        if USE_SETTINGS:
-            self.collection_name = collection_name or settings.collection_name
-            self.persist_directory = persist_directory or settings.vectorstore_path
-        else:
-            self.collection_name = collection_name or "default_collection"
-            self.persist_directory = persist_directory or "./data/vectorstore"
+        # Hybrid search settings
+        self.enable_hybrid = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
+        self.bm25_weight = float(os.getenv("BM25_WEIGHT", "0.3"))
         
-        logger.info(f"Initializing UnifiedVectorStore: {self.collection_name}")
-        logger.info(f"Persist directory: {self.persist_directory}")
+        # BM25 index (built lazily)
+        self._bm25_index = None
+        self._bm25_documents = None
+        self._bm25_ids = None
         
-        # Ensure persist directory exists
+        # Create persist directory
         Path(self.persist_directory).mkdir(parents=True, exist_ok=True)
         
-        # Initialize OpenAI embeddings
-        try:
-            if USE_SETTINGS:
-                embedding_model = embedding_model or settings.embedding_model
-            else:
-                embedding_model = embedding_model or "text-embedding-3-large"
-            self.embeddings = OpenAIEmbeddings(model=embedding_model)
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI embeddings: {e}")
-            raise
-        
-        logger.info(f"Using embedding model: {self.embeddings.model}")
-        
         # Initialize ChromaDB client
-        try:
-            self.client = chromadb.PersistentClient(
-                path=self.persist_directory,
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
+        self.client = chromadb.PersistentClient(
+            path=self.persist_directory,
+            settings=ChromaSettings(
+                anonymized_telemetry=False,
+                allow_reset=True
             )
         )
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB client: {e}")
-            raise
         
         # Get or create collection
-        try:
-            self.collection = self.client.get_or_create_collection(
-                name=self.collection_name,
-                metadata={
-                    "description": "Berlin Media Archive - Multi-modal RAG",
-                    "embedding_model": self.embeddings.model,
-                    "created_at": datetime.now().isoformat()
-                }
-            )
-            logger.info(f"Collection ready: {self.collection_name}")
-            logger.info(f"Current collection size: {self.collection.count()} documents")
-        except Exception as e:
-            logger.error(f"Failed to initialize collection: {e}")
-            raise
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        
+        logger.info(f"UnifiedVectorStore initialized: {self.collection_name} at {self.persist_directory}")
+        logger.info(f"Collection has {self.collection.count()} documents")
+        logger.info(f"Hybrid search: {'enabled' if self.enable_hybrid and BM25_AVAILABLE else 'disabled'}")
     
-    def add_audio_segments(
+    def add_texts(
         self,
-        segments: List[TranscriptSegment],
-        audio_metadata: Dict,
-        batch_size: int = 100
-    ) -> int:
+        texts: List[str],
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+        ids: Optional[List[str]] = None,
+        embeddings: Optional[List[List[float]]] = None
+    ) -> List[str]:
         """
-        Add audio transcript segments to the vector store.
+        Add texts to the vector store.
         
         Args:
-            segments: List of TranscriptSegment objects
-            audio_metadata: Audio file metadata
-            batch_size: Batch size for adding documents
+            texts: List of text strings to add
+            metadatas: Optional list of metadata dicts for each text
+            ids: Optional list of IDs (generated if not provided)
+            embeddings: Optional pre-computed embeddings
             
         Returns:
-            Number of segments added
+            List of IDs for added documents
         """
-        logger.info(f"Adding {len(segments)} audio segments to vector store")
+        if not texts:
+            logger.warning("No texts provided to add_texts")
+            return []
+        
+        # Generate IDs if not provided
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in texts]
+        
+        # Ensure metadatas list matches texts
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
+        
+        # Clean metadata - ChromaDB only accepts str, int, float, bool
+        cleaned_metadatas = []
+        for meta in metadatas:
+            cleaned = {}
+            for k, v in meta.items():
+                if isinstance(v, (str, int, float, bool)):
+                    cleaned[k] = v
+                elif isinstance(v, list):
+                    cleaned[k] = str(v)  # Convert lists to string
+                elif v is not None:
+                    cleaned[k] = str(v)  # Convert other types to string
+            cleaned_metadatas.append(cleaned)
         
         try:
-            for i in range(0, len(segments), batch_size):
-                batch = segments[i:i + batch_size]
-                
-                # Prepare data for batch
-                ids = []
-                documents = []
-                metadatas = []
-                embeddings_list = []
-                
-                for segment in batch:
-                    # Generate unique ID
-                    segment_id = str(uuid.uuid4())
-                    
-                    # Prepare document text
-                    doc_text = segment.text
-                    
-                    # Prepare metadata
-                    metadata = {
-                        "type": "audio",
-                        "source": audio_metadata.get("filename", "unknown"),
-                        "filepath": audio_metadata.get("filepath", ""),
-                        "start_time": segment.start_time,
-                        "end_time": segment.end_time,
-                        "timestamp": f"{segment.start_time:.2f}-{segment.end_time:.2f}",
-                        "duration": segment.end_time - segment.start_time,
-                        "speaker": segment.speaker or "UNKNOWN",
-                        "confidence": segment.confidence or 1.0,
-                        "audio_duration": audio_metadata.get("duration_seconds", 0),
-                        "added_at": datetime.now().isoformat()
-                    }
-                    
-                    ids.append(segment_id)
-                    documents.append(doc_text)
-                    metadatas.append(metadata)
-                
-                # Generate embeddings for batch
-                logger.debug(f"Generating embeddings for batch of {len(documents)} segments")
-                batch_embeddings = self.embeddings.embed_texts(documents)
-                embeddings_list.extend(batch_embeddings)
-                
-                # Add batch to collection
+            if embeddings:
                 self.collection.add(
+                    documents=texts,
+                    metadatas=cleaned_metadatas,
                     ids=ids,
-                    documents=documents,
-                    metadatas=metadatas,
-                    embeddings=embeddings_list
+                    embeddings=embeddings
                 )
-                
-                logger.debug(f"Added batch {i//batch_size + 1}: {len(batch)} segments")
+            else:
+                # Let ChromaDB compute embeddings
+                self.collection.add(
+                    documents=texts,
+                    metadatas=cleaned_metadatas,
+                    ids=ids
+                )
             
-            logger.info(f"Successfully added {len(segments)} audio segments")
-            return len(segments)
+            # Invalidate BM25 index
+            self._bm25_index = None
+            
+            logger.info(f"Added {len(texts)} texts to vector store")
+            return ids
             
         except Exception as e:
-            logger.error(f"Failed to add audio segments: {e}", exc_info=True)
+            logger.error(f"Error adding texts to vector store: {e}")
             raise
     
-    def add_document_chunks(
+    def add_documents(
         self,
-        chunks: List[DocumentChunk],
-        document_metadata: Dict,
-        batch_size: int = 100
-    ) -> int:
+        documents: List[Dict[str, Any]],
+        source_type: str = "document"
+    ) -> List[str]:
         """
-        Add document chunks to the vector store.
+        Add documents with metadata to vector store.
         
         Args:
-            chunks: List of DocumentChunk objects
-            document_metadata: Document metadata
-            batch_size: Batch size for adding documents
+            documents: List of dicts with 'content' and optional metadata
+            source_type: Type of source (audio/document)
             
         Returns:
-            Number of chunks added
+            List of document IDs
         """
-        logger.info(f"Adding {len(chunks)} document chunks to vector store")
+        texts = []
+        metadatas = []
+        ids = []
+        
+        for doc in documents:
+            content = doc.get("content", doc.get("text", ""))
+            if not content:
+                continue
+            
+            texts.append(content)
+            
+            # Build metadata
+            meta = {
+                "source_type": source_type,
+                "chunk_id": doc.get("chunk_id", str(uuid.uuid4())),
+            }
+            
+            # Add optional metadata fields
+            for field in ["page_number", "source_file", "timestamp_start", 
+                         "timestamp_end", "speaker", "title", "author"]:
+                if field in doc:
+                    meta[field] = doc[field]
+            
+            metadatas.append(meta)
+            ids.append(doc.get("id", str(uuid.uuid4())))
+        
+        return self.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+    
+    def _build_bm25_index(self):
+        """Build BM25 index from all documents in collection."""
+        if not BM25_AVAILABLE:
+            return
         
         try:
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i + batch_size]
-                
-                # Prepare data for batch
-                ids = []
-                documents = []
-                metadatas = []
-                embeddings_list = []
-                
-                for chunk in batch:
-                    # Use chunk's own ID or generate new one
-                    chunk_id = chunk.chunk_id or str(uuid.uuid4())
-                    
-                    # Prepare document text
-                    doc_text = chunk.text
-                    
-                    # Prepare metadata
-                    metadata = {
-                        "type": "text",
-                        "source": document_metadata.get("filename", "unknown"),
-                        "filepath": document_metadata.get("filepath", ""),
-                        "page_number": chunk.page_number,
-                        "chunk_index": chunk.chunk_index,
-                        "chunk_id": chunk_id,
-                        "char_count": len(chunk.text),
-                        "word_count": len(chunk.text.split()),
-                        "total_pages": document_metadata.get("num_pages", 0),
-                        "document_title": chunk.metadata.get("document_title", ""),
-                        "document_author": chunk.metadata.get("document_author", ""),
-                        "added_at": datetime.now().isoformat()
-                    }
-                    
-                    ids.append(chunk_id)
-                    documents.append(doc_text)
-                    metadatas.append(metadata)
-                
-                # Generate embeddings for batch
-                logger.debug(f"Generating embeddings for batch of {len(documents)} chunks")
-                batch_embeddings = self.embeddings.embed_texts(documents)
-                embeddings_list.extend(batch_embeddings)
-                
-                # Add batch to collection
-                self.collection.add(
-                    ids=ids,
-                    documents=documents,
-                    metadatas=metadatas,
-                    embeddings=embeddings_list
-                )
-                
-                logger.debug(f"Added batch {i//batch_size + 1}: {len(batch)} chunks")
+            # Get all documents
+            all_docs = self.collection.get()
             
-            logger.info(f"Successfully added {len(chunks)} document chunks")
-            return len(chunks)
+            if not all_docs or not all_docs['documents']:
+                logger.warning("No documents to build BM25 index")
+                return
+            
+            self._bm25_documents = all_docs['documents']
+            self._bm25_ids = all_docs['ids']
+            self._bm25_metadatas = all_docs['metadatas']
+            
+            # Tokenize documents
+            tokenized_docs = [doc.lower().split() for doc in self._bm25_documents]
+            
+            # Build BM25 index
+            self._bm25_index = BM25Okapi(tokenized_docs)
+            
+            logger.info(f"Built BM25 index with {len(self._bm25_documents)} documents")
             
         except Exception as e:
-            logger.error(f"Failed to add document chunks: {e}", exc_info=True)
-            raise
+            logger.error(f"Failed to build BM25 index: {e}")
+            self._bm25_index = None
     
     def search(
         self,
         query: str,
-        n_results: Optional[int] = None,
-        filter_metadata: Optional[Dict] = None,
-        include_embeddings: bool = False
-    ):
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Semantic search in the vector store.
+        Search for similar documents using semantic search.
         
         Args:
-            query: Search query
-            n_results: Number of results to return
-            filter_metadata: Optional metadata filters
-            include_embeddings: Whether to include embeddings in results
+            query: Search query string
+            top_k: Number of results to return
+            filters: Optional metadata filters
             
         Returns:
-            Dictionary with search results
+            List of results with content, metadata, and scores
         """
-        n_results = n_results or settings.top_k_results
-        
-        logger.info(f"Searching for: '{query}' (top {n_results})")
-        if filter_metadata:
-            logger.info(f"Filters: {filter_metadata}")
-        
         try:
-            # Generate query embedding using OpenAI
-            query_embedding = self.embeddings.embed_text(query)
+            # Build where clause for filters
+            where = None
+            if filters:
+                where = {}
+                for k, v in filters.items():
+                    where[k] = v
             
-            # Prepare include list
-            include: List[Literal["documents", "embeddings", "metadatas", "distances", "uris", "data"]] = ["documents", "metadatas", "distances"]
-            if include_embeddings:
-                include.append("embeddings")
-            
-            # Perform search
             results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-                where=filter_metadata,
-                include=include
+                query_texts=[query],
+                n_results=top_k,
+                where=where
             )
             
-            logger.info(f"Found {len(results['ids'][0])} results")
-            return results
+            # Format results
+            formatted_results = []
+            if results and results['documents'] and results['documents'][0]:
+                for i, doc in enumerate(results['documents'][0]):
+                    result = {
+                        "content": doc,
+                        "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
+                        "id": results['ids'][0][i] if results['ids'] else None,
+                        "score": 1 - results['distances'][0][i] if results['distances'] else 0.0
+                    }
+                    formatted_results.append(result)
+            
+            logger.info(f"Search returned {len(formatted_results)} results for query: {query[:50]}...")
+            return formatted_results
             
         except Exception as e:
-            logger.error(f"Search failed: {e}", exc_info=True)
-            raise
+            logger.error(f"Search failed: {e}")
+            return []
     
     def hybrid_search(
         self,
         query: str,
-        n_results: int,
-        filter_metadata: Optional[Dict] = None,
-        semantic_weight: float = 0.7
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        bm25_weight: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
-        Hybrid search combining semantic (vector) and keyword (BM25) search.
+        Hybrid search combining semantic search with BM25.
         
         Args:
-            query: Search query
-            n_results: Number of results to return
-            filter_metadata: Optional metadata filters
-            semantic_weight: Weight for semantic search (0-1)
+            query: Search query string
+            top_k: Number of results to return
+            filters: Optional metadata filters
+            bm25_weight: Weight for BM25 scores (0-1). Semantic weight = 1 - bm25_weight
             
         Returns:
-            List of ranked results with metadata
+            List of results with content, metadata, and combined scores
         """
-        n_results = n_results or settings.top_k_results
-        keyword_weight = 1 - semantic_weight
+        bm25_weight = bm25_weight if bm25_weight is not None else self.bm25_weight
         
-        logger.info(f"Hybrid search for: '{query}'")
-        logger.info(f"Weights - Semantic: {semantic_weight}, Keyword: {keyword_weight}")
+        # If hybrid search disabled or BM25 not available, fall back to semantic
+        if not self.enable_hybrid or not BM25_AVAILABLE:
+            logger.debug("Using semantic-only search")
+            return self.search(query, top_k, filters)
         
         try:
-            # 1. Semantic Search
-            semantic_results = self.search(
-                query=query,
-                n_results=n_results * 2,
-                filter_metadata=filter_metadata
-            )
+            # Build BM25 index if needed
+            if self._bm25_index is None:
+                self._build_bm25_index()
             
-            # 2. Keyword Search (BM25)
-            keyword_results = self._keyword_search(
-                query=query,
-                n_results=n_results * 2,
-                filter_metadata=filter_metadata
-            )
+            # If BM25 index still not available, fall back to semantic
+            if self._bm25_index is None:
+                return self.search(query, top_k, filters)
             
-            # 3. Combine and re-rank results
-            combined_results = self._combine_results(
-                semantic_results,
-                keyword_results,
-                semantic_weight,
-                keyword_weight,
-                n_results
-            )
+            # Get semantic search results (get more to allow for re-ranking)
+            semantic_k = min(top_k * 3, self.collection.count())
+            semantic_results = self.search(query, semantic_k, filters)
             
-            logger.info(f"Hybrid search returned {len(combined_results)} results")
-            return combined_results
+            # Get BM25 scores
+            tokenized_query = query.lower().split()
+            bm25_scores = self._bm25_index.get_scores(tokenized_query)
+            
+            # Normalize BM25 scores
+            max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
+            normalized_bm25 = {
+                self._bm25_ids[i]: score / max_bm25 
+                for i, score in enumerate(bm25_scores)
+            }
+            
+            # Combine scores
+            combined_results = []
+            for result in semantic_results:
+                doc_id = result.get('id')
+                semantic_score = result.get('score', 0)
+                bm25_score = normalized_bm25.get(doc_id, 0)
+                
+                # Combined score: weighted average
+                combined_score = (1 - bm25_weight) * semantic_score + bm25_weight * bm25_score
+                
+                combined_results.append({
+                    "content": result['content'],
+                    "metadata": result['metadata'],
+                    "id": doc_id,
+                    "score": combined_score,
+                    "semantic_score": semantic_score,
+                    "bm25_score": bm25_score
+                })
+            
+            # Sort by combined score
+            combined_results.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Return top_k results
+            final_results = combined_results[:top_k]
+            
+            logger.info(f"Hybrid search returned {len(final_results)} results for query: {query[:50]}...")
+            return final_results
             
         except Exception as e:
-            logger.error(f"Hybrid search failed: {e}", exc_info=True)
-            logger.warning("Falling back to semantic search only")
-            semantic_results = self.search(query, n_results, filter_metadata)
-            return self._format_search_results(semantic_results)
+            logger.error(f"Hybrid search failed, falling back to semantic: {e}")
+            return self.search(query, top_k, filters)
     
-    def _keyword_search(
+    def similarity_search(
         self,
         query: str,
-        n_results: int,
-        filter_metadata: Optional[Dict] = None
-    ) -> Dict[str, Any]:
-        """Perform keyword-based search using BM25."""
-        try:
-            from rank_bm25 import BM25Okapi
-            import numpy as np
-            
-            # Get all documents
-            all_docs = self.collection.get(
-                where=filter_metadata,
-                include=["documents", "metadatas"]
-            )
-            
-            if not all_docs["documents"]:
-                return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-            
-            # Tokenize
-            tokenized_docs = [doc.lower().split() for doc in all_docs["documents"]]
-            bm25 = BM25Okapi(tokenized_docs)
-            tokenized_query = query.lower().split()
-            scores = bm25.get_scores(tokenized_query)
-            
-            # Get top results
-            top_indices = np.argsort(scores)[::-1][:n_results]
-            
-            # Handle case where metadatas might be None
-            metadatas = all_docs.get("metadatas") or [{}] * len(all_docs["ids"])
-            
-            return {
-                "ids": [[all_docs["ids"][i] for i in top_indices]],
-                "documents": [[all_docs["documents"][i] for i in top_indices]],
-                "metadatas": [[metadatas[i] for i in top_indices]],
-                "distances": [[1.0 / (1.0 + scores[i]) for i in top_indices]]
-            }
-            
-        except Exception as e:
-            logger.warning(f"Keyword search failed: {e}")
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-    
-    def _combine_results(
-        self,
-        semantic_results: Any,
-        keyword_results: Any,
-        semantic_weight: float,
-        keyword_weight: float,
-        n_results: int
+        k: int = 5,
+        filter: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
-        """Combine and re-rank results."""
-        combined_scores = {}
+        """
+        Alias for search() to match LangChain interface.
         
-        # Process semantic results
-        for i, doc_id in enumerate(semantic_results["ids"][0]):
-            distance = semantic_results["distances"][0][i]
-            similarity = 1 / (1 + distance)
-            combined_scores[doc_id] = {
-                "semantic_score": similarity * semantic_weight,
-                "keyword_score": 0,
-                "document": semantic_results["documents"][0][i],
-                "metadata": semantic_results["metadatas"][0][i]
-            }
-        
-        # Add keyword results
-        for i, doc_id in enumerate(keyword_results["ids"][0]):
-            distance = keyword_results["distances"][0][i]
-            similarity = 1 / (1 + distance)
+        Args:
+            query: Search query string
+            k: Number of results to return
+            filter: Optional metadata filters
             
-            if doc_id in combined_scores:
-                combined_scores[doc_id]["keyword_score"] = similarity * keyword_weight
-            else:
-                combined_scores[doc_id] = {
-                    "semantic_score": 0,
-                    "keyword_score": similarity * keyword_weight,
-                    "document": keyword_results["documents"][0][i],
-                    "metadata": keyword_results["metadatas"][0][i]
-                }
-        
-        # Calculate final scores and sort
-        results = []
-        for doc_id, scores in combined_scores.items():
-            final_score = scores["semantic_score"] + scores["keyword_score"]
-            results.append({
-                "id": doc_id,
-                "document": scores["document"],
-                "metadata": scores["metadata"],
-                "score": final_score,
-                "semantic_score": scores["semantic_score"],
-                "keyword_score": scores["keyword_score"]
-            })
-        
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:n_results]
-    
-    def _format_search_results(self, results: Any) -> List[Dict[str, Any]]:
-        """Format search results."""
-        formatted = []
-        for i in range(len(results["ids"][0])):
-            formatted.append({
-                "id": results["ids"][0][i],
-                "document": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
-                "distance": results["distances"][0][i],
-                "score": 1 / (1 + results["distances"][0][i])
-            })
-        return formatted
-    
-    def get_by_metadata(
-        self,
-        filter_metadata: Dict,
-        limit: Optional[int] = None
-    ):
-        """Get documents by metadata filter."""
-        logger.info(f"Getting documents with filter: {filter_metadata}")
-        try:
-            results = self.collection.get(
-                where=filter_metadata,
-                limit=limit,
-                include=["documents", "metadatas"]
-            )
-            logger.info(f"Found {len(results['ids'])} documents")
-            return results
-        except Exception as e:
-            logger.error(f"Failed to get documents: {e}")
-            raise
-    
-    def delete_by_source(self, source_filename: str) -> int:
-        """Delete all documents from a source."""
-        logger.info(f"Deleting documents from: {source_filename}")
-        try:
-            docs = self.collection.get(where={"source": source_filename})
-            if docs["ids"]:
-                self.collection.delete(ids=docs["ids"])
-                logger.info(f"Deleted {len(docs['ids'])} documents")
-                return len(docs["ids"])
-            return 0
-        except Exception as e:
-            logger.error(f"Delete failed: {e}")
-            raise
+        Returns:
+            List of results
+        """
+        return self.search(query=query, top_k=k, filters=filter)
     
     def get_collection_stats(self) -> Dict[str, Any]:
-        """Get collection statistics."""
-        try:
-            total_count = self.collection.count()
-            audio_docs = self.collection.get(where={"type": "audio"}, include=[])
-            text_docs = self.collection.get(where={"type": "text"}, include=[])
-            
-            return {
-                "total_documents": total_count,
-                "audio_segments": len(audio_docs["ids"]),
-                "text_chunks": len(text_docs["ids"]),
-                "collection_name": self.collection_name,
-                "embedding_model": self.embeddings.model
-            }
-        except Exception as e:
-            logger.error(f"Failed to get collection stats: {e}")
-            raise
+        """Get statistics about the collection."""
+        return {
+            "collection_name": self.collection_name,
+            "total_documents": self.collection.count(),
+            "persist_directory": self.persist_directory,
+            "hybrid_search_enabled": self.enable_hybrid and BM25_AVAILABLE,
+            "bm25_weight": self.bm25_weight
+        }
     
-    def reset_collection(self):
-        """Reset the collection."""
-        logger.warning(f"Resetting collection: {self.collection_name}")
+    def delete_collection(self):
+        """Delete the entire collection."""
         try:
             self.client.delete_collection(self.collection_name)
-            self.collection = self.client.create_collection(
-                name=self.collection_name,
-                metadata={
-                    "description": "Berlin Media Archive - Multi-modal RAG",
-                    "embedding_model": self.embeddings.model,
-                    "created_at": datetime.now().isoformat()
-                }
-            )
-            logger.info("Collection reset complete")
+            self._bm25_index = None
+            logger.info(f"Deleted collection: {self.collection_name}")
         except Exception as e:
-            logger.error(f"Reset failed: {e}")
+            logger.error(f"Error deleting collection: {e}")
             raise
+    
+    def clear(self):
+        """Clear all documents from the collection."""
+        try:
+            # Delete and recreate collection
+            self.client.delete_collection(self.collection_name)
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            self._bm25_index = None
+            logger.info(f"Cleared collection: {self.collection_name}")
+        except Exception as e:
+            logger.error(f"Error clearing collection: {e}")
+            raise
+    
+    def get_all_documents(self) -> List[Dict[str, Any]]:
+        """Get all documents from the collection."""
+        try:
+            all_docs = self.collection.get()
+            
+            if not all_docs or not all_docs['documents']:
+                return []
+            
+            documents = []
+            for i, doc in enumerate(all_docs['documents']):
+                documents.append({
+                    "content": doc,
+                    "metadata": all_docs['metadatas'][i] if all_docs['metadatas'] else {},
+                    "id": all_docs['ids'][i] if all_docs['ids'] else None
+                })
+            
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Failed to get all documents: {e}")
+            return []

@@ -239,61 +239,94 @@ async def ingest_audio(
 
 
 # Document Upload Endpoint
-@router.post("/ingest/document", response_model=IngestResponse)
-async def ingest_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="PDF document to ingest"),
-    save_chunks: bool = Form(True, description="Save chunks to disk")
-):
+@router.post("/ingest/document")
+async def ingest_document(file: UploadFile = File(...)):
     """
-    Ingest a PDF document into the archive.
-    
-    The document will be chunked intelligently with page number tracking.
+    Ingest a document file (PDF, DOCX, TXT).
     """
-    if not pipeline:
-        raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    
     try:
+        logger.info(f"Received document for ingestion: {file.filename}")
+        
         # Validate file type
-        if not file.filename or not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        allowed_extensions = [".pdf", ".docx", ".doc", ".txt"]
+        file_ext = Path(file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}. Allowed: {allowed_extensions}"
+            )
         
         # Save uploaded file
-        doc_path = Path(settings.documents_dir) / file.filename
-        with open(doc_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        documents_dir = Path(os.getenv("DOCUMENTS_DIR", "./data/documents"))
+        documents_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Uploaded document: {file.filename}")
+        file_path = documents_dir / file.filename
         
-        # Process document in background
-        def process_document_task():
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Saved file to: {file_path}")
+        
+        # Process document
+        from ingestion.document_ingestion import DocumentIngestionPipeline
+        
+        pipeline = DocumentIngestionPipeline()
+        output_dir = os.getenv("OUTPUT_DIR", "./output") + "/documents"
+        
+        chunks, metadata = pipeline.ingest_document(str(file_path), output_dir)
+        
+        # Add chunks to vector store
+        items_added = 0
+        if chunks:
             try:
-                document_ingestion = DocumentIngestionPipeline()
-                output_dir = os.path.join(settings.output_dir, "documents")
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
-                document_ingestion.ingest_document(str(doc_path), output_dir)
-                logger.info(f"Document processing complete: {file.filename}")
+                from vectorstore.chroma_store import UnifiedVectorStore
+                
+                vector_store = UnifiedVectorStore()
+                
+                # Prepare documents for vector store
+                documents = []
+                for chunk in chunks:
+                    doc = {
+                        "id": f"{file.filename}_{chunk.chunk_id}",
+                        "content": chunk.content,
+                        "page_number": chunk.page_number,
+                        "source_file": chunk.source_file,
+                        "title": metadata.get("title", ""),
+                        "author": metadata.get("author", ""),
+                        "chunk_id": chunk.chunk_id
+                    }
+                    documents.append(doc)
+                
+                # Add to vector store
+                ids = vector_store.add_documents(documents, source_type="document")
+                items_added = len(ids)
+                
+                logger.info(f"Added {items_added} chunks to vector store")
+                
             except Exception as e:
-                logger.error(f"Background document processing failed: {e}")
+                logger.error(f"Failed to add to vector store: {e}")
+                # Continue - document is still processed, just not indexed
         
-        background_tasks.add_task(process_document_task)
-        
-        return IngestResponse(
-            success=True,
-            message="Document ingested successfully",
-            filename=file.filename,
-            items_added=0,
-            metadata={
-                "num_pages": 0,
-                "num_chunks": 0,
-                "title": "",
-                "author": ""
+        return {
+            "success": True,
+            "message": "Document ingested successfully",
+            "filename": file.filename,
+            "items_added": items_added,
+            "metadata": {
+                "num_pages": metadata.get("num_pages", 0),
+                "num_chunks": metadata.get("num_chunks", 0),
+                "title": metadata.get("title", ""),
+                "author": metadata.get("author", "")
             }
-        )
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Document ingestion failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Document ingestion failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Batch Ingest Endpoint
