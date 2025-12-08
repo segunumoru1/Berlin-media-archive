@@ -6,10 +6,11 @@ Handles both audio and document embeddings with hybrid search support.
 import os
 import uuid
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from loguru import logger
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.utils import embedding_functions
 
 # Try to import BM25 for hybrid search
 try:
@@ -29,7 +30,8 @@ class UnifiedVectorStore:
     def __init__(
         self,
         persist_directory: Optional[str] = None,
-        collection_name: Optional[str] = None
+        collection_name: Optional[str] = None,
+        reset_collection: bool = False
     ):
         """
         Initialize the unified vector store.
@@ -37,6 +39,7 @@ class UnifiedVectorStore:
         Args:
             persist_directory: Directory to persist ChromaDB data
             collection_name: Name of the collection
+            reset_collection: If True, delete and recreate the collection
         """
         self.persist_directory = persist_directory or os.getenv("VECTORSTORE_PATH", "./data/vectorstore")
         self.collection_name = collection_name or os.getenv("COLLECTION_NAME", "berlin_archive")
@@ -49,9 +52,23 @@ class UnifiedVectorStore:
         self._bm25_index = None
         self._bm25_documents = None
         self._bm25_ids = None
+        self._bm25_metadatas = None
         
         # Create persist directory
         Path(self.persist_directory).mkdir(parents=True, exist_ok=True)
+        
+        # Initialize OpenAI embedding function
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if openai_api_key:
+            self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+                api_key=openai_api_key,
+                model_name=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+            )
+            logger.info(f"Using OpenAI embeddings: {os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')}")
+        else:
+            # Fallback to default
+            self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
+            logger.warning("No OpenAI API key found, using default embeddings")
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(
@@ -62,34 +79,92 @@ class UnifiedVectorStore:
             )
         )
         
-        # Get or create collection
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
+        # Handle collection creation with embedding function
+        self._initialize_collection(reset_collection)
         
         logger.info(f"UnifiedVectorStore initialized: {self.collection_name} at {self.persist_directory}")
         logger.info(f"Collection has {self.collection.count()} documents")
         logger.info(f"Hybrid search: {'enabled' if self.enable_hybrid and BM25_AVAILABLE else 'disabled'}")
     
+    def _initialize_collection(self, reset_collection: bool = False):
+        """
+        Initialize or reset the collection with proper embedding function.
+        """
+        try:
+            # Check if collection exists
+            existing_collections = [c.name for c in self.client.list_collections()]
+            collection_exists = self.collection_name in existing_collections
+            
+            if reset_collection and collection_exists:
+                logger.info(f"Resetting collection: {self.collection_name}")
+                self.client.delete_collection(self.collection_name)
+                collection_exists = False
+            
+            if collection_exists:
+                # Try to get existing collection
+                try:
+                    # First try without embedding function to check compatibility
+                    self.collection = self.client.get_collection(
+                        name=self.collection_name,
+                        embedding_function=self.embedding_function
+                    )
+                except ValueError as e:
+                    if "embedding function" in str(e).lower():
+                        # Embedding function conflict - need to recreate
+                        logger.warning(f"Embedding function conflict detected. Recreating collection...")
+                        logger.warning("⚠️  Existing documents will be lost. Please re-ingest after restart.")
+                        
+                        self.client.delete_collection(self.collection_name)
+                        self.collection = self.client.create_collection(
+                            name=self.collection_name,
+                            embedding_function=self.embedding_function,
+                            metadata={"hnsw:space": "cosine"}
+                        )
+                    else:
+                        raise
+            else:
+                # Create new collection
+                self.collection = self.client.create_collection(
+                    name=self.collection_name,
+                    embedding_function=self.embedding_function,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.info(f"Created new collection: {self.collection_name}")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize collection: {e}")
+            raise
+    
+    def _build_where_clause(self, filters: Optional[Dict[str, Any]]) -> Optional[Dict]:
+        """
+        Build ChromaDB where clause from filters.
+        """
+        if not filters:
+            return None
+        
+        # Remove None values
+        filters = {k: v for k, v in filters.items() if v is not None}
+        
+        if not filters:
+            return None
+        
+        # Single filter
+        if len(filters) == 1:
+            key, value = list(filters.items())[0]
+            return {key: {"$eq": value}}
+        
+        # Multiple filters - use $and operator
+        conditions = [{k: {"$eq": v}} for k, v in filters.items()]
+        return {"$and": conditions}
+    
     def add_texts(
         self,
         texts: List[str],
         metadatas: Optional[List[Dict[str, Any]]] = None,
-        ids: Optional[List[str]] = None,
-        embeddings: Optional[List[List[float]]] = None
+        ids: Optional[List[str]] = None
     ) -> List[str]:
         """
         Add texts to the vector store.
-        
-        Args:
-            texts: List of text strings to add
-            metadatas: Optional list of metadata dicts for each text
-            ids: Optional list of IDs (generated if not provided)
-            embeddings: Optional pre-computed embeddings
-            
-        Returns:
-            List of IDs for added documents
         """
         if not texts:
             logger.warning("No texts provided to add_texts")
@@ -111,26 +186,17 @@ class UnifiedVectorStore:
                 if isinstance(v, (str, int, float, bool)):
                     cleaned[k] = v
                 elif isinstance(v, list):
-                    cleaned[k] = str(v)  # Convert lists to string
+                    cleaned[k] = str(v)
                 elif v is not None:
-                    cleaned[k] = str(v)  # Convert other types to string
+                    cleaned[k] = str(v)
             cleaned_metadatas.append(cleaned)
         
         try:
-            if embeddings:
-                self.collection.add(
-                    documents=texts,
-                    metadatas=cleaned_metadatas,
-                    ids=ids,
-                    embeddings=embeddings
-                )
-            else:
-                # Let ChromaDB compute embeddings
-                self.collection.add(
-                    documents=texts,
-                    metadatas=cleaned_metadatas,
-                    ids=ids
-                )
+            self.collection.add(
+                documents=texts,
+                metadatas=cleaned_metadatas,
+                ids=ids
+            )
             
             # Invalidate BM25 index
             self._bm25_index = None
@@ -149,13 +215,6 @@ class UnifiedVectorStore:
     ) -> List[str]:
         """
         Add documents with metadata to vector store.
-        
-        Args:
-            documents: List of dicts with 'content' and optional metadata
-            source_type: Type of source (audio/document)
-            
-        Returns:
-            List of document IDs
         """
         texts = []
         metadatas = []
@@ -168,16 +227,14 @@ class UnifiedVectorStore:
             
             texts.append(content)
             
-            # Build metadata
             meta = {
                 "source_type": source_type,
                 "chunk_id": doc.get("chunk_id", str(uuid.uuid4())),
             }
             
-            # Add optional metadata fields
-            for field in ["page_number", "source_file", "timestamp_start", 
-                         "timestamp_end", "speaker", "title", "author"]:
-                if field in doc:
+            for field in ["page_number", "source_file", "source", "timestamp_start", 
+                         "timestamp_end", "speaker", "title", "author", "timestamp"]:
+                if field in doc and doc[field] is not None:
                     meta[field] = doc[field]
             
             metadatas.append(meta)
@@ -191,7 +248,6 @@ class UnifiedVectorStore:
             return
         
         try:
-            # Get all documents
             all_docs = self.collection.get()
             
             if not all_docs or not all_docs['documents']:
@@ -202,10 +258,7 @@ class UnifiedVectorStore:
             self._bm25_ids = all_docs['ids']
             self._bm25_metadatas = all_docs['metadatas']
             
-            # Tokenize documents
             tokenized_docs = [doc.lower().split() for doc in self._bm25_documents]
-            
-            # Build BM25 index
             self._bm25_index = BM25Okapi(tokenized_docs)
             
             logger.info(f"Built BM25 index with {len(self._bm25_documents)} documents")
@@ -222,46 +275,40 @@ class UnifiedVectorStore:
     ) -> List[Dict[str, Any]]:
         """
         Search for similar documents using semantic search.
-        
-        Args:
-            query: Search query string
-            top_k: Number of results to return
-            filters: Optional metadata filters
-            
-        Returns:
-            List of results with content, metadata, and scores
         """
         try:
-            # Build where clause for filters
-            where = None
-            if filters:
-                where = {}
-                for k, v in filters.items():
-                    where[k] = v
+            doc_count = self.collection.count()
+            logger.info(f"Searching in collection with {doc_count} documents")
+            
+            if doc_count == 0:
+                logger.warning("Collection is empty")
+                return []
+            
+            where = self._build_where_clause(filters)
             
             results = self.collection.query(
                 query_texts=[query],
-                n_results=top_k,
+                n_results=min(top_k, doc_count),
                 where=where
             )
             
-            # Format results
             formatted_results = []
             if results and results['documents'] and results['documents'][0]:
                 for i, doc in enumerate(results['documents'][0]):
                     result = {
                         "content": doc,
+                        "document": doc,
                         "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
                         "id": results['ids'][0][i] if results['ids'] else None,
                         "score": 1 - results['distances'][0][i] if results['distances'] else 0.0
                     }
                     formatted_results.append(result)
             
-            logger.info(f"Search returned {len(formatted_results)} results for query: {query[:50]}...")
+            logger.info(f"Search returned {len(formatted_results)} results")
             return formatted_results
             
         except Exception as e:
-            logger.error(f"Search failed: {e}")
+            logger.error(f"Search failed: {e}", exc_info=True)
             return []
     
     def hybrid_search(
@@ -273,59 +320,46 @@ class UnifiedVectorStore:
     ) -> List[Dict[str, Any]]:
         """
         Hybrid search combining semantic search with BM25.
-        
-        Args:
-            query: Search query string
-            top_k: Number of results to return
-            filters: Optional metadata filters
-            bm25_weight: Weight for BM25 scores (0-1). Semantic weight = 1 - bm25_weight
-            
-        Returns:
-            List of results with content, metadata, and combined scores
         """
         bm25_weight = bm25_weight if bm25_weight is not None else self.bm25_weight
         
-        # If hybrid search disabled or BM25 not available, fall back to semantic
         if not self.enable_hybrid or not BM25_AVAILABLE:
-            logger.debug("Using semantic-only search")
             return self.search(query, top_k, filters)
         
         try:
-            # Build BM25 index if needed
             if self._bm25_index is None:
                 self._build_bm25_index()
             
-            # If BM25 index still not available, fall back to semantic
             if self._bm25_index is None:
                 return self.search(query, top_k, filters)
             
-            # Get semantic search results (get more to allow for re-ranking)
-            semantic_k = min(top_k * 3, self.collection.count())
+            doc_count = self.collection.count()
+            semantic_k = min(top_k * 3, doc_count) if doc_count > 0 else top_k
             semantic_results = self.search(query, semantic_k, filters)
             
-            # Get BM25 scores
+            if not semantic_results:
+                return []
+            
             tokenized_query = query.lower().split()
             bm25_scores = self._bm25_index.get_scores(tokenized_query)
             
-            # Normalize BM25 scores
             max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
             normalized_bm25 = {
                 self._bm25_ids[i]: score / max_bm25 
                 for i, score in enumerate(bm25_scores)
             }
             
-            # Combine scores
             combined_results = []
             for result in semantic_results:
                 doc_id = result.get('id')
                 semantic_score = result.get('score', 0)
                 bm25_score = normalized_bm25.get(doc_id, 0)
                 
-                # Combined score: weighted average
                 combined_score = (1 - bm25_weight) * semantic_score + bm25_weight * bm25_score
                 
                 combined_results.append({
                     "content": result['content'],
+                    "document": result['content'],
                     "metadata": result['metadata'],
                     "id": doc_id,
                     "score": combined_score,
@@ -333,40 +367,17 @@ class UnifiedVectorStore:
                     "bm25_score": bm25_score
                 })
             
-            # Sort by combined score
             combined_results.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Return top_k results
-            final_results = combined_results[:top_k]
-            
-            logger.info(f"Hybrid search returned {len(final_results)} results for query: {query[:50]}...")
-            return final_results
+            return combined_results[:top_k]
             
         except Exception as e:
-            logger.error(f"Hybrid search failed, falling back to semantic: {e}")
+            logger.error(f"Hybrid search failed: {e}")
             return self.search(query, top_k, filters)
     
-    def similarity_search(
-        self,
-        query: str,
-        k: int = 5,
-        filter: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Alias for search() to match LangChain interface.
-        
-        Args:
-            query: Search query string
-            k: Number of results to return
-            filter: Optional metadata filters
-            
-        Returns:
-            List of results
-        """
+    def similarity_search(self, query: str, k: int = 5, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         return self.search(query=query, top_k=k, filters=filter)
     
     def get_collection_stats(self) -> Dict[str, Any]:
-        """Get statistics about the collection."""
         return {
             "collection_name": self.collection_name,
             "total_documents": self.collection.count(),
@@ -376,7 +387,6 @@ class UnifiedVectorStore:
         }
     
     def delete_collection(self):
-        """Delete the entire collection."""
         try:
             self.client.delete_collection(self.collection_name)
             self._bm25_index = None
@@ -386,12 +396,11 @@ class UnifiedVectorStore:
             raise
     
     def clear(self):
-        """Clear all documents from the collection."""
         try:
-            # Delete and recreate collection
             self.client.delete_collection(self.collection_name)
-            self.collection = self.client.get_or_create_collection(
+            self.collection = self.client.create_collection(
                 name=self.collection_name,
+                embedding_function=self.embedding_function,
                 metadata={"hnsw:space": "cosine"}
             )
             self._bm25_index = None
@@ -401,22 +410,21 @@ class UnifiedVectorStore:
             raise
     
     def get_all_documents(self) -> List[Dict[str, Any]]:
-        """Get all documents from the collection."""
         try:
             all_docs = self.collection.get()
             
             if not all_docs or not all_docs['documents']:
                 return []
             
-            documents = []
-            for i, doc in enumerate(all_docs['documents']):
-                documents.append({
+            return [
+                {
                     "content": doc,
+                    "document": doc,
                     "metadata": all_docs['metadatas'][i] if all_docs['metadatas'] else {},
                     "id": all_docs['ids'][i] if all_docs['ids'] else None
-                })
-            
-            return documents
+                }
+                for i, doc in enumerate(all_docs['documents'])
+            ]
             
         except Exception as e:
             logger.error(f"Failed to get all documents: {e}")
