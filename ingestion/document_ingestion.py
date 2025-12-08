@@ -6,13 +6,16 @@ Handles PDF and document processing with intelligent chunking and metadata extra
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 import hashlib
 
 from pypdf import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from loguru import logger
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 from utils.config import settings
 
@@ -52,8 +55,8 @@ class DocumentIngestionPipeline:
     
     def __init__(
         self,
-        chunk_size: int = None,
-        chunk_overlap: int = None
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None
     ):
         """
         Initialize document ingestion pipeline.
@@ -62,8 +65,8 @@ class DocumentIngestionPipeline:
             chunk_size: Size of text chunks in characters
             chunk_overlap: Overlap between chunks in characters
         """
-        self.chunk_size = chunk_size or settings.pdf_chunk_size
-        self.chunk_overlap = chunk_overlap or settings.pdf_chunk_overlap
+        self.chunk_size = chunk_size or settings.chunk_size
+        self.chunk_overlap = chunk_overlap or settings.chunk_overlap
         
         logger.info(f"Initializing DocumentIngestionPipeline")
         logger.info(f"Chunk size: {self.chunk_size}, Overlap: {self.chunk_overlap}")
@@ -79,7 +82,7 @@ class DocumentIngestionPipeline:
     
     def ingest_document(
         self,
-        document_path: str,
+        document_path: Union[str, Path],
         output_dir: Optional[str] = None
     ) -> Tuple[List[DocumentChunk], Dict]:
         """
@@ -331,7 +334,7 @@ class DocumentIngestionPipeline:
     
     def batch_ingest_documents(
         self,
-        document_dir: str,
+        document_dir: Union[str, Path],
         output_dir: Optional[str] = None,
         file_pattern: str = "*.pdf"
     ) -> Dict[str, Tuple[List[DocumentChunk], Dict]]:
@@ -368,7 +371,7 @@ class DocumentIngestionPipeline:
 
 
 def ingest_document_file(
-    document_path: str,
+    document_path: Union[str, Path],
     output_dir: Optional[str] = None
 ) -> Tuple[List[DocumentChunk], Dict]:
     """
@@ -386,7 +389,7 @@ def ingest_document_file(
 
 
 def batch_ingest_documents(
-    document_dir: str,
+    document_dir: Union[str, Path],
     output_dir: Optional[str] = None
 ) -> Dict[str, Tuple[List[DocumentChunk], Dict]]:
     """

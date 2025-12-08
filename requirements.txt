@@ -1,5 +1,6 @@
 # Core Dependencies
 openai>=1.12.0
+huggingface-hub>=0.18.1
 
 # Audio Processing
 openai-whisper>=20231117

@@ -7,13 +7,13 @@ from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import json
-
-from loguru import logger
 from openai import OpenAI
-
 from vectorstore.chroma_store import UnifiedVectorStore
 from utils.config import settings
 
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 @dataclass
 class Citation:

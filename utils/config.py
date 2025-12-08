@@ -6,15 +6,14 @@ Centralized settings using Pydantic Settings.
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from pathlib import Path
-import os
 
 
 class Settings(BaseSettings):
     """Application settings."""
     
     # API Keys
-    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
-    huggingface_token: str = Field(None, env="HUGGINGFACE_TOKEN")
+    openai_api_key: str = Field(validation_alias="OPENAI_API_KEY")
+    huggingface_token: str = Field(default=None, validation_alias="HUGGINGFACE_TOKEN")
     
     # OpenAI Models
     llm_model: str = Field("gpt-4-turbo-preview", env="LLM_MODEL")

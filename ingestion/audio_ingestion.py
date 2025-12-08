@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pydub import AudioSegment
-from loguru import logger
+import logging
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 from utils.config import settings
 
 
@@ -50,7 +52,7 @@ class AudioIngestionPipeline:
     
     def __init__(
         self,
-        whisper_model: str = None,
+        whisper_model: Optional[str] = None,
         enable_diarization: bool = True
     ):
         """
@@ -95,11 +97,11 @@ class AudioIngestionPipeline:
             # Load pretrained pipeline
             self.diarization_pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=settings.huggingface_token
+                token=settings.huggingface_token
             )
             
             # Use GPU if available
-            if torch.cuda.is_available():
+            if self.diarization_pipeline and torch.cuda.is_available():
                 self.diarization_pipeline.to(torch.device("cuda"))
                 logger.info("Diarization pipeline loaded on GPU")
             else:
@@ -111,7 +113,7 @@ class AudioIngestionPipeline:
     
     def ingest_audio(
         self,
-        audio_path: str,
+        audio_path: str | Path,
         output_dir: Optional[str] = None
     ) -> Tuple[List[TranscriptSegment], Dict]:
         """
@@ -244,6 +246,11 @@ class AudioIngestionPipeline:
             Segments with speaker labels
         """
         try:
+            # Check if diarization pipeline is available
+            if self.diarization_pipeline is None:
+                logger.warning("Diarization pipeline not available, skipping diarization")
+                return segments
+            
             # Run diarization
             diarization = self.diarization_pipeline(str(audio_path))
             

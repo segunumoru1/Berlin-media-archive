@@ -11,7 +11,10 @@ from pathlib import Path
 import shutil
 from datetime import datetime
 
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 from pipeline.orchestrator import BerlinArchivePipeline
 from utils.config import settings
@@ -422,8 +425,9 @@ async def reset_collection(confirm: bool = Query(False, description="Must be tru
     except Exception as e:
         logger.error(f"Reset operation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Reset operation failed: {str(e)}")
+    
 
-# RAGAS Evaluation Endpoint
+# RAG Evaluation Endpoint
 @router.post("/evaluate")
 async def evaluate_response(request: EvaluationRequest):
     """

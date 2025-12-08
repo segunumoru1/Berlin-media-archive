@@ -6,15 +6,133 @@ Production-grade evaluation system using LLM as an evaluator.
 import os
 import json
 from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
 from openai import OpenAI
-from loguru import logger
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-from .metrics import (
-    ComprehensiveEvaluation,
-    BatchEvaluationResult,
-    MetricType,
-    EvaluationResult
-)
+
+class MetricType(Enum):
+    """Types of evaluation metrics."""
+    FAITHFULNESS = "faithfulness"
+    RELEVANCE = "relevance"
+    CITATION_QUALITY = "citation_quality"
+    CONTEXT_PRECISION = "context_precision"
+    CONTEXT_RECALL = "context_recall"
+    ANSWER_COMPLETENESS = "answer_completeness"
+
+
+@dataclass
+class EvaluationResult:
+    """Single metric evaluation result."""
+    metric_type: MetricType
+    score: float
+    reason: Optional[str] = None
+
+
+@dataclass
+class ComprehensiveEvaluation:
+    """Comprehensive evaluation result for a single response."""
+    question: str
+    answer: str
+    retrieved_context: List[str]
+    faithfulness: float
+    relevance: float
+    citation_quality: float
+    context_precision: Optional[float] = None
+    context_recall: Optional[float] = None
+    answer_completeness: Optional[float] = None
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    
+    @property
+    def overall_score(self) -> float:
+        """Calculate overall score from all metrics."""
+        scores = [self.faithfulness, self.relevance, self.citation_quality]
+        if self.context_precision is not None:
+            scores.append(self.context_precision)
+        if self.context_recall is not None:
+            scores.append(self.context_recall)
+        if self.answer_completeness is not None:
+            scores.append(self.answer_completeness)
+        return sum(scores) / len(scores) if scores else 0.0
+    
+    @property
+    def grade(self) -> str:
+        """Get letter grade based on overall score."""
+        score = self.overall_score
+        if score >= 0.9: return "A"
+        if score >= 0.8: return "B"
+        if score >= 0.7: return "C"
+        if score >= 0.6: return "D"
+        return "F"
+    
+    @property
+    def is_production_ready(self) -> bool:
+        """Check if response meets production quality standards."""
+        return (self.faithfulness >= 0.8 and 
+                self.relevance >= 0.8 and 
+                self.citation_quality >= 0.7 and
+                len(self.errors) == 0)
+
+
+@dataclass
+class BatchEvaluationResult:
+    """Batch evaluation results."""
+    total_cases: int
+    individual_results: List[ComprehensiveEvaluation]
+    
+    @property
+    def avg_faithfulness(self) -> float:
+        return sum(r.faithfulness for r in self.individual_results) / len(self.individual_results)
+    
+    @property
+    def avg_relevance(self) -> float:
+        return sum(r.relevance for r in self.individual_results) / len(self.individual_results)
+    
+    @property
+    def avg_citation_quality(self) -> float:
+        return sum(r.citation_quality for r in self.individual_results) / len(self.individual_results)
+    
+    @property
+    def avg_overall(self) -> float:
+        return sum(r.overall_score for r in self.individual_results) / len(self.individual_results)
+    
+    @property
+    def production_ready_count(self) -> int:
+        return sum(1 for r in self.individual_results if r.is_production_ready)
+    
+    @property
+    def production_ready_percentage(self) -> float:
+        return (self.production_ready_count / self.total_cases * 100) if self.total_cases > 0 else 0.0
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "total_cases": self.total_cases,
+            "avg_faithfulness": self.avg_faithfulness,
+            "avg_relevance": self.avg_relevance,
+            "avg_citation_quality": self.avg_citation_quality,
+            "avg_overall": self.avg_overall,
+            "production_ready_count": self.production_ready_count,
+            "production_ready_percentage": self.production_ready_percentage,
+            "individual_results": [
+                {
+                    "question": r.question,
+                    "answer": r.answer,
+                    "faithfulness": r.faithfulness,
+                    "relevance": r.relevance,
+                    "citation_quality": r.citation_quality,
+                    "overall_score": r.overall_score,
+                    "grade": r.grade,
+                    "errors": r.errors,
+                    "warnings": r.warnings
+                }
+                for r in self.individual_results
+            ]
+        }
 
 
 class LLMRAGEvaluator:
@@ -25,7 +143,7 @@ class LLMRAGEvaluator:
     
     def __init__(
         self,
-        model: str = "gpt-4-turbo-preview",
+        model: str = "gpt-5.1-codex-001",
         temperature: float = 0.0,
         api_key: Optional[str] = None
     ):

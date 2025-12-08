@@ -3,7 +3,7 @@ Test Cases for RAG Evaluation
 Provides sample test cases and utilities for creating evaluation datasets.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 
 
@@ -13,8 +13,8 @@ class TestCase:
     question: str
     answer: str
     context: List[str]
-    ground_truth: str = None
-    expected_grade: str = None
+    ground_truth: Optional[str] = None
+    expected_grade: Optional[str] = None
     description: str = ""
 
 
@@ -92,8 +92,8 @@ class EvaluationTestCases:
         question: str,
         answer: str,
         context: List[str],
-        ground_truth: str = None,
-        expected_grade: str = None,
+        ground_truth: Optional[str] = None,
+        expected_grade: Optional[str] = None,
         description: str = ""
     ) -> Dict:
         """

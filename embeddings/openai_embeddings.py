@@ -8,7 +8,10 @@ import os
 from typing import List, Optional, Union
 import numpy as np
 from openai import OpenAI
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class OpenAIEmbeddings:
