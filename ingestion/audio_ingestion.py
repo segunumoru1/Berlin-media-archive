@@ -1,388 +1,183 @@
 """
-Audio Ingestion Pipeline
-Handles audio transcription with timestamp preservation and speaker diarization.
+Audio Ingestion Pipeline using Whisper and Speaker Diarization
 """
 
 import os
 import json
-import whisper
-import torch
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
-from pydub import AudioSegment
-import logging
+import whisper
+from loguru import logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-from utils.config import settings
-
+# Use our custom audio utils instead of pydub
+from utils.audio_utils import get_audio_duration
 
 @dataclass
 class TranscriptSegment:
-    """Represents a single transcript segment with metadata."""
+    """Transcript segment with metadata"""
     text: str
     start_time: float
     end_time: float
     speaker: Optional[str] = None
     confidence: Optional[float] = None
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary."""
+
+    def to_dict(self) -> dict:
         return asdict(self)
-    
-    def get_timestamp_str(self) -> str:
-        """Get formatted timestamp string."""
-        return f"{self._format_time(self.start_time)} - {self._format_time(self.end_time)}"
-    
-    @staticmethod
-    def _format_time(seconds: float) -> str:
-        """Format seconds to MM:SS or HH:MM:SS."""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
 
 
 class AudioIngestionPipeline:
-    """Pipeline for ingesting and transcribing audio files."""
+    """Audio ingestion with Whisper transcription and speaker diarization"""
     
     def __init__(
         self,
-        whisper_model: Optional[str] = None,
-        enable_diarization: bool = True
+        whisper_model: str = "base",
+        enable_diarization: bool = True,
+        chunk_length_seconds: int = 30
     ):
-        """
-        Initialize audio ingestion pipeline.
+        self.whisper_model_name = whisper_model
+        self.enable_diarization = enable_diarization
+        self.chunk_length_ms = chunk_length_seconds * 1000
         
-        Args:
-            whisper_model: Whisper model size (tiny, base, small, medium, large)
-            enable_diarization: Whether to enable speaker diarization
-        """
-        self.whisper_model_name = whisper_model or settings.whisper_model
-        self.enable_diarization = enable_diarization and settings.enable_speaker_diarization
+        logger.info(f"Loading Whisper model: {whisper_model}")
+        self.whisper_model = whisper.load_model(whisper_model)
         
-        logger.info(f"Initializing AudioIngestionPipeline with model: {self.whisper_model_name}")
-        
-        # Load Whisper model
-        try:
-            self.whisper_model = whisper.load_model(self.whisper_model_name)
-            logger.info("Whisper model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}")
-            raise
-        
-        # Initialize diarization pipeline if enabled
         self.diarization_pipeline = None
-        if self.enable_diarization:
+        if enable_diarization:
             try:
-                self._initialize_diarization()
+                from pyannote.audio import Pipeline
+                hf_token = os.getenv("HUGGINGFACE_TOKEN")
+                if hf_token:
+                    self.diarization_pipeline = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        token=hf_token
+                    )
+                    logger.info("Speaker diarization enabled")
+                else:
+                    logger.warning("HUGGINGFACE_TOKEN not set, diarization disabled")
             except Exception as e:
-                logger.warning(f"Failed to initialize diarization: {e}. Continuing without diarization.")
-                self.enable_diarization = False
+                logger.warning(f"Could not load diarization pipeline: {e}")
     
-    def _initialize_diarization(self):
-        """Initialize speaker diarization pipeline."""
+    def transcribe_audio(self, audio_path: str) -> Dict[str, Any]:
+        """Transcribe audio using Whisper"""
+        logger.info(f"Transcribing: {audio_path}")
+        
+        result = self.whisper_model.transcribe(
+            audio_path,
+            language="en",
+            task="transcribe",
+            verbose=False
+        )
+        
+        return result
+    
+    def perform_diarization(self, audio_path: str) -> Optional[Dict]:
+        """Perform speaker diarization"""
+        if not self.diarization_pipeline:
+            return None
+        
         try:
-            from pyannote.audio import Pipeline
+            logger.info("Performing speaker diarization...")
+            diarization = self.diarization_pipeline(audio_path)
             
-            # Check if HuggingFace token is available
-            if not settings.huggingface_token:
-                logger.warning("HUGGINGFACE_TOKEN not set. Diarization disabled.")
-                return
-            
-            # Load pretrained pipeline
-            self.diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=settings.huggingface_token
-            )
-            
-            # Use GPU if available
-            if self.diarization_pipeline and torch.cuda.is_available():
-                self.diarization_pipeline.to(torch.device("cuda"))
-                logger.info("Diarization pipeline loaded on GPU")
-            else:
-                logger.info("Diarization pipeline loaded on CPU")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize diarization: {e}")
-            raise
-    
-    def ingest_audio(
-        self,
-        audio_path: str | Path,
-        output_dir: Optional[str] = None
-    ) -> Tuple[List[TranscriptSegment], Dict]:
-        """
-        Ingest and transcribe audio file with timestamps.
-        
-        Args:
-            audio_path: Path to audio file
-            output_dir: Optional directory to save transcription results
-            
-        Returns:
-            Tuple of (transcript_segments, metadata)
-        """
-        try:
-            audio_path = Path(audio_path)
-            logger.info(f"Ingesting audio file: {audio_path}")
-            
-            # Validate file exists
-            if not audio_path.exists():
-                raise FileNotFoundError(f"Audio file not found: {audio_path}")
-            
-            # Get audio metadata
-            metadata = self._get_audio_metadata(audio_path)
-            logger.info(f"Audio metadata: duration={metadata['duration_seconds']:.2f}s")
-            
-            # Transcribe with Whisper
-            logger.info("Starting transcription...")
-            transcription_result = self._transcribe_with_whisper(audio_path)
-            
-            # Extract segments with timestamps
-            segments = self._extract_segments(transcription_result)
-            logger.info(f"Extracted {len(segments)} transcript segments")
-            
-            # Perform speaker diarization if enabled
-            if self.enable_diarization and self.diarization_pipeline:
-                logger.info("Performing speaker diarization...")
-                segments = self._apply_diarization(audio_path, segments)
-            
-            # Save results if output directory specified
-            if output_dir:
-                self._save_results(audio_path, segments, metadata, output_dir)
-            
-            logger.info("Audio ingestion completed successfully")
-            return segments, metadata
-            
-        except Exception as e:
-            logger.error(f"Audio ingestion failed: {e}", exc_info=True)
-            raise
-    
-    def _get_audio_metadata(self, audio_path: Path) -> Dict:
-        """Extract audio file metadata."""
-        try:
-            audio = AudioSegment.from_file(str(audio_path))
-            
-            return {
-                "filename": audio_path.name,
-                "filepath": str(audio_path),
-                "duration_seconds": len(audio) / 1000.0,
-                "channels": audio.channels,
-                "frame_rate": audio.frame_rate,
-                "sample_width": audio.sample_width,
-                "file_size_mb": audio_path.stat().st_size / (1024 * 1024)
-            }
-        except Exception as e:
-            logger.warning(f"Failed to extract metadata with pydub: {e}")
-            return {
-                "filename": audio_path.name,
-                "filepath": str(audio_path),
-                "file_size_mb": audio_path.stat().st_size / (1024 * 1024)
-            }
-    
-    def _transcribe_with_whisper(self, audio_path: Path) -> Dict:
-        """
-        Transcribe audio using Whisper.
-        
-        Args:
-            audio_path: Path to audio file
-            
-        Returns:
-            Whisper transcription result with segments
-        """
-        try:
-            result = self.whisper_model.transcribe(
-                str(audio_path),
-                task="transcribe",
-                language=None,  # Auto-detect
-                word_timestamps=True,
-                verbose=False
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
-            raise
-    
-    def _extract_segments(self, transcription_result: Dict) -> List[TranscriptSegment]:
-        """
-        Extract transcript segments from Whisper result.
-        
-        Args:
-            transcription_result: Whisper transcription output
-            
-        Returns:
-            List of TranscriptSegment objects
-        """
-        segments = []
-        
-        for segment in transcription_result.get("segments", []):
-            transcript_segment = TranscriptSegment(
-                text=segment["text"].strip(),
-                start_time=segment["start"],
-                end_time=segment["end"],
-                confidence=segment.get("no_speech_prob", None)
-            )
-            segments.append(transcript_segment)
-        
-        return segments
-    
-    def _apply_diarization(
-        self,
-        audio_path: Path,
-        segments: List[TranscriptSegment]
-    ) -> List[TranscriptSegment]:
-        """
-        Apply speaker diarization to transcript segments.
-        
-        Args:
-            audio_path: Path to audio file
-            segments: List of transcript segments
-            
-        Returns:
-            Segments with speaker labels
-        """
-        try:
-            # Check if diarization pipeline is available
-            if self.diarization_pipeline is None:
-                logger.warning("Diarization pipeline not available, skipping diarization")
-                return segments
-            
-            # Run diarization
-            diarization = self.diarization_pipeline(str(audio_path))
-            
-            # Create speaker timeline
-            speaker_timeline = []
+            speaker_segments = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
-                speaker_timeline.append({
+                speaker_segments.append({
                     "start": turn.start,
                     "end": turn.end,
                     "speaker": speaker
                 })
             
-            # Assign speakers to segments
-            for segment in segments:
-                segment.speaker = self._find_speaker(
-                    segment.start_time,
-                    segment.end_time,
-                    speaker_timeline
-                )
-            
-            logger.info(f"Diarization complete. Speakers found: {self._count_speakers(segments)}")
-            return segments
-            
+            return {"segments": speaker_segments}
         except Exception as e:
             logger.error(f"Diarization failed: {e}")
-            # Return segments without speaker labels
-            return segments
+            return None
     
-    def _find_speaker(
+    def merge_transcription_with_speakers(
         self,
-        start_time: float,
-        end_time: float,
-        speaker_timeline: List[Dict]
-    ) -> str:
-        """
-        Find the speaker for a given time range.
+        transcription: Dict[str, Any],
+        diarization: Optional[Dict]
+    ) -> List[TranscriptSegment]:
+        """Merge Whisper transcription with speaker labels"""
+        segments = []
         
-        Args:
-            start_time: Segment start time
-            end_time: Segment end time
-            speaker_timeline: List of speaker turns
+        for segment in transcription.get("segments", []):
+            speaker = None
             
-        Returns:
-            Speaker label
-        """
-        # Find overlapping speaker turns
-        overlaps = []
-        segment_duration = end_time - start_time
-        
-        for turn in speaker_timeline:
-            overlap_start = max(start_time, turn["start"])
-            overlap_end = min(end_time, turn["end"])
-            overlap_duration = max(0, overlap_end - overlap_start)
+            if diarization:
+                mid_time = (segment["start"] + segment["end"]) / 2
+                for spk_seg in diarization.get("segments", []):
+                    if spk_seg["start"] <= mid_time <= spk_seg["end"]:
+                        speaker = spk_seg["speaker"]
+                        break
             
-            if overlap_duration > 0:
-                overlaps.append({
-                    "speaker": turn["speaker"],
-                    "overlap": overlap_duration
-                })
+            segments.append(TranscriptSegment(
+                text=segment["text"].strip(),
+                start_time=segment["start"],
+                end_time=segment["end"],
+                speaker=speaker,
+                confidence=segment.get("confidence")
+            ))
         
-        # Return speaker with most overlap
-        if overlaps:
-            best_match = max(overlaps, key=lambda x: x["overlap"])
-            return best_match["speaker"]
-        
-        return "UNKNOWN"
+        return segments
     
-    def _count_speakers(self, segments: List[TranscriptSegment]) -> int:
-        """Count unique speakers in segments."""
-        speakers = set(seg.speaker for seg in segments if seg.speaker)
-        return len(speakers)
-    
-    def _save_results(
+    def ingest_audio(
         self,
-        audio_path: Path,
-        segments: List[TranscriptSegment],
-        metadata: Dict,
+        audio_path: str,
         output_dir: str
-    ):
-        """
-        Save transcription results to files.
-        
-        Args:
-            audio_path: Original audio file path
-            segments: Transcript segments
-            metadata: Audio metadata
-            output_dir: Output directory
-        """
+    ) -> Dict[str, Any]:
+        """Main ingestion pipeline"""
         try:
+            audio_file = Path(audio_path)
+            if not audio_file.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_file}")
+            
+            logger.info(f"Processing audio: {audio_file}")
+            
+            # Get audio duration
+            duration = get_audio_duration(str(audio_file))
+            
+            # Transcribe
+            transcription = self.transcribe_audio(str(audio_file))
+            
+            # Diarization (optional)
+            diarization = None
+            if self.enable_diarization and self.diarization_pipeline:
+                diarization = self.perform_diarization(str(audio_file))
+            
+            # Merge results
+            segments = self.merge_transcription_with_speakers(
+                transcription,
+                diarization
+            )
+            
+            # Extract unique speakers
+            speakers = list(set(
+                seg.speaker for seg in segments if seg.speaker
+            ))
+            
+            # Save results
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             
-            base_name = audio_path.stem
+            output_file = output_path / f"{audio_file.stem}_transcript.json"
             
-            # Save JSON with full details
-            json_path = output_path / f"{base_name}_transcript.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "metadata": metadata,
-                    "segments": [seg.to_dict() for seg in segments],
-                    "full_text": " ".join(seg.text for seg in segments)
-                }, f, indent=2, ensure_ascii=False)
+            result = {
+                "source_file": str(audio_path),
+                "duration_seconds": duration,
+                "num_segments": len(segments),
+                "speakers": speakers,
+                "segments": [seg.to_dict() for seg in segments],
+                "full_text": " ".join(seg.text for seg in segments)
+            }
             
-            logger.info(f"Saved JSON transcript: {json_path}")
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
             
-            # Save human-readable text with timestamps
-            txt_path = output_path / f"{base_name}_transcript.txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"Transcription: {audio_path.name}\n")
-                f.write(f"Duration: {metadata.get('duration_seconds', 'N/A')}s\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for segment in segments:
-                    speaker_label = f"[{segment.speaker}] " if segment.speaker else ""
-                    f.write(f"[{segment.get_timestamp_str()}] {speaker_label}{segment.text}\n")
+            logger.info(f"Saved transcript to: {output_file}")
             
-            logger.info(f"Saved text transcript: {txt_path}")
+            return result
             
         except Exception as e:
-            logger.error(f"Failed to save results: {e}")
-
-
-def ingest_audio_file(audio_path: str, output_dir: Optional[str] = None) -> Tuple[List[TranscriptSegment], Dict]:
-    """
-    Convenience function to ingest a single audio file.
-    
-    Args:
-        audio_path: Path to audio file
-        output_dir: Optional output directory
-        
-    Returns:
-        Tuple of (segments, metadata)
-    """
-    pipeline = AudioIngestionPipeline()
-    return pipeline.ingest_audio(audio_path, output_dir)
+            logger.error(f"Audio ingestion failed: {e}", exc_info=True)
+            raise

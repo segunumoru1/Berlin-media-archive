@@ -122,7 +122,7 @@ class UnifiedVectorStore:
                         "filepath": audio_metadata.get("filepath", ""),
                         "start_time": segment.start_time,
                         "end_time": segment.end_time,
-                        "timestamp": segment.get_timestamp_str(),
+                        "timestamp": f"{segment.start_time:.2f}-{segment.end_time:.2f}",
                         "duration": segment.end_time - segment.start_time,
                         "speaker": segment.speaker or "UNKNOWN",
                         "confidence": segment.confidence or 1.0,

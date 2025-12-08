@@ -83,10 +83,16 @@ class BerlinArchivePipeline:
         try:
             # Step 1: Transcribe audio
             output_dir = settings.output_dir if save_transcription else None
-            segments, metadata = self.audio_pipeline.ingest_audio(
+            result = self.audio_pipeline.ingest_audio(
                 audio_path,
                 output_dir=output_dir
             )
+            
+            # Ensure result is the correct type
+            if isinstance(result, tuple) and len(result) == 2:
+                segments, metadata = result
+            else:
+                raise ValueError(f"Unexpected return type from ingest_audio: {type(result)}")
             
             # Step 2: Add to vector store
             num_added = self.vector_store.add_audio_segments(segments, metadata)
