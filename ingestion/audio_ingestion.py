@@ -95,21 +95,37 @@ class AudioIngestionPipeline:
                     from pyannote.audio import Pipeline
                     
                     logger.info("Loading speaker diarization pipeline...")
-                    self.diarization_pipeline = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        use_auth_token=hf_token
-                    )
                     
+                    # Try new parameter name first (token), then fall back to old name (use_auth_token)
+                    try:
+                        self.diarization_pipeline = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            token=hf_token  # New parameter name
+                        )
+                    except TypeError:
+                        # Fallback for older versions
+                        self.diarization_pipeline = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=hf_token  # Old parameter name
+                        )
+                    
+                    # Move to GPU if available
                     if torch.cuda.is_available():
                         self.diarization_pipeline.to(torch.device("cuda"))
                     
                     logger.info("✅ Speaker diarization enabled")
+                except ImportError:
+                    logger.warning("pyannote.audio not installed, diarization disabled")
+                    logger.warning("Install with: pip install pyannote.audio")
+                    self.enable_diarization = False
                 except Exception as e:
                     logger.warning(f"Failed to load diarization pipeline: {e}")
                     logger.warning("Speaker diarization disabled")
                     self.enable_diarization = False
             else:
                 logger.warning("HUGGINGFACE_TOKEN not set, diarization disabled")
+                logger.warning("To enable: Add HUGGINGFACE_TOKEN to .env file")
+                logger.warning("Get token from: https://huggingface.co/settings/tokens")
                 self.enable_diarization = False
         
         logger.info(f"Audio ingestion pipeline initialized (model={self.model_size}, device={self.device}, diarization={self.enable_diarization})")
@@ -134,7 +150,7 @@ class AudioIngestionPipeline:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
         
-        logger.info(f"Ingesting audio: {audio_path.name}")
+        logger.info(f"Processing audio: {audio_path.name}")
         logger.info(f"File size: {audio_path.stat().st_size / 1024 / 1024:.2f} MB")
         
         try:
@@ -148,9 +164,12 @@ class AudioIngestionPipeline:
             if self.enable_diarization and self.diarization_pipeline:
                 try:
                     segments = self.apply_diarization(str(audio_path), transcription)
-                    logger.info(f"✅ Diarization applied, identified {len(set(s.speaker for s in segments if s.speaker))} speakers")
+                    speakers = set(s.speaker for s in segments if s.speaker and s.speaker != "Unknown")
+                    logger.info(f"✅ Diarization applied, identified {len(speakers)} unique speakers")
+                    if speakers:
+                        logger.info(f"   Speakers: {sorted(speakers)}")
                 except Exception as e:
-                    logger.warning(f"Diarization failed: {e}, using transcription without speakers")
+                    logger.warning(f"Diarization failed: {e}, using transcription without speaker labels")
                     segments = transcription
             else:
                 segments = transcription
@@ -204,7 +223,8 @@ class AudioIngestionPipeline:
                 audio_path,
                 language="en",
                 task="transcribe",
-                verbose=False
+                verbose=False,
+                word_timestamps=False  # Set to True if you need word-level timestamps
             )
             
             if not result or "segments" not in result:
@@ -218,11 +238,11 @@ class AudioIngestionPipeline:
                     start_time=seg["start"],
                     end_time=seg["end"],
                     speaker=None,  # Will be filled by diarization if enabled
-                    confidence=seg.get("no_speech_prob")
+                    confidence=1.0 - seg.get("no_speech_prob", 0)
                 )
                 segments.append(segment)
             
-            logger.info(f"✅ Transcribed {len(segments)} segments from audio")
+            logger.info(f"✅ Transcribed {len(segments)} segments ({result.get('text', '')[:50]}...)")
             
             return segments
             
@@ -260,7 +280,7 @@ class AudioIngestionPipeline:
                 segment_start = segment.start_time
                 segment_end = segment.end_time
                 
-                # Find overlapping speaker
+                # Find overlapping speaker with maximum overlap
                 max_overlap = 0
                 best_speaker = None
                 
@@ -273,16 +293,19 @@ class AudioIngestionPipeline:
                         max_overlap = overlap
                         best_speaker = speaker
                 
-                segment.speaker = best_speaker if best_speaker else "UNKNOWN"
+                segment.speaker = best_speaker if best_speaker else "SPEAKER_UNKNOWN"
             
             # Count unique speakers
             speakers = set(s.speaker for s in transcription if s.speaker)
-            logger.info(f"Identified {len(speakers)} unique speakers: {speakers}")
+            logger.info(f"✅ Identified {len(speakers)} unique speakers: {sorted(speakers)}")
             
             return transcription
             
         except Exception as e:
-            logger.error(f"Diarization failed: {e}")
+            logger.error(f"Diarization failed: {e}", exc_info=True)
+            # Return transcription without speaker labels
+            for segment in transcription:
+                segment.speaker = "Unknown"
             return transcription
     
     def save_segments(
@@ -306,7 +329,19 @@ class AudioIngestionPipeline:
         
         output_file = output_dir / f"{Path(filename).stem}_transcript.json"
         
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump([seg.to_dict() for seg in segments], f, indent=2, ensure_ascii=False)
+        # Prepare data for JSON serialization
+        segments_data = [seg.to_dict() for seg in segments]
         
-        logger.info(f"Saved transcript to: {output_file}")
+        # Add summary
+        output_data = {
+            "source_file": filename,
+            "num_segments": len(segments),
+            "total_duration": segments[-1].end_time if segments else 0,
+            "speakers": list(set(s.speaker for s in segments if s.speaker)),
+            "segments": segments_data
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"✅ Saved transcript to: {output_file}")
