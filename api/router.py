@@ -113,6 +113,8 @@ async def query_archive(request: QueryRequest):
         
         filter_metadata = filters if filters else None
         
+        logger.info(f"Filters applied: {filter_metadata}")
+        
         # Search for relevant chunks
         results = vector_store.hybrid_search(
             query=request.query,
@@ -130,6 +132,13 @@ async def query_archive(request: QueryRequest):
                 metadata={"num_chunks_retrieved": 0, "num_citations": 0}
             )
         
+        # Helper function to format timestamp
+        def format_timestamp(seconds: float) -> str:
+            """Convert seconds to MM:SS format."""
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes:02d}:{secs:02d}"
+        
         # Build context from results
         context_parts = []
         for i, result in enumerate(results):
@@ -138,10 +147,11 @@ async def query_archive(request: QueryRequest):
             
             # Format citation based on source type
             if source_type == 'audio':
-                timestamp = metadata.get('timestamp_start', 0)
-                minutes = int(timestamp // 60)
-                seconds = int(timestamp % 60)
-                source_info = f"{metadata.get('source_file', 'Unknown')} [{minutes:02d}:{seconds:02d}]"
+                timestamp_start = metadata.get('timestamp_start', 0)
+                timestamp_end = metadata.get('timestamp_end', 0)
+                time_str = format_timestamp(timestamp_start)
+                source_info = f"{metadata.get('source_file', 'Unknown')} [{time_str}]"
+                
                 speaker = metadata.get('speaker', 'Unknown')
                 if speaker and speaker != 'Unknown':
                     source_info += f" ({speaker})"
@@ -169,7 +179,8 @@ Your task:
 IMPORTANT: 
 - Only use information from the provided context
 - Always cite your sources using the [Source X] format
-- For audio, include timestamps when discussing specific quotes"""
+- For audio, include speaker names when discussing specific quotes
+- If a specific speaker is mentioned in the question, focus on that speaker's contributions"""
 
         user_prompt = f"""Context from the archive:
 
@@ -192,7 +203,7 @@ Please provide a comprehensive answer with proper citations."""
         
         answer = response.choices[0].message.content
         
-        # Build citations
+        # Build citations with formatted timestamps
         citations = []
         for i, result in enumerate(results):
             metadata = result.get('metadata', {})
@@ -201,14 +212,18 @@ Please provide a comprehensive answer with proper citations."""
                 "source_file": metadata.get('source_file', 'Unknown'),
                 "source_type": metadata.get('source_type', 'document'),
                 "content_preview": result['content'][:200] + "..." if len(result['content']) > 200 else result['content'],
-                "relevance_score": result.get('score', 0)
+                "relevance_score": round(result.get('score', 0), 4)
             }
             
             # Add type-specific metadata
             if metadata.get('source_type') == 'audio':
-                citation["timestamp_start"] = metadata.get('timestamp_start', 0)
-                citation["timestamp_end"] = metadata.get('timestamp_end', 0)
-                citation["speaker"] = metadata.get('speaker')
+                timestamp_start = metadata.get('timestamp_start', 0)
+                timestamp_end = metadata.get('timestamp_end', 0)
+                
+                citation["timestamp_start"] = timestamp_start
+                citation["timestamp_end"] = timestamp_end
+                citation["timestamp_formatted"] = f"{format_timestamp(timestamp_start)} - {format_timestamp(timestamp_end)}"
+                citation["speaker"] = metadata.get('speaker', 'Unknown')
             else:
                 citation["page_number"] = metadata.get('page_number')
             
@@ -506,7 +521,7 @@ async def ingest_audio(
         
         # Determine diarization method
         if diarization_method is None:
-            diarization_method = os.getenv("DIARIZATION_METHOD", "pyannote").lower()
+            diarization_method = os.getenv("DIARIZATION_METHOD", "assemblyai").lower()
         
         # Process audio based on method
         if enable_diarization and diarization_method == "assemblyai":
@@ -517,11 +532,8 @@ async def ingest_audio(
                 output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
                 segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
             except Exception as e:
-                logger.warning(f"AssemblyAI failed: {e}, falling back to pyannote")
-                from ingestion.audio_ingestion import AudioIngestionPipeline
-                audio_pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
-                output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
-                segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
+                logger.error(f"AssemblyAI failed: {e}")
+                raise HTTPException(status_code=500, detail=f"AssemblyAI transcription failed: {str(e)}")
         else:
             # Use pyannote or no diarization
             from ingestion.audio_ingestion import AudioIngestionPipeline
@@ -531,6 +543,12 @@ async def ingest_audio(
             segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
         
         logger.info(f"Created {len(segments)} segments from audio")
+        
+        # Debug: Log first few segments to verify speaker labels
+        if segments:
+            logger.info(f"Sample segments:")
+            for i, seg in enumerate(segments[:3]):
+                logger.info(f"  Segment {i}: speaker={seg.speaker}, time={seg.start_time:.2f}-{seg.end_time:.2f}s, text={seg.text[:50]}...")
         
         # Add to vector store
         items_added = 0
@@ -542,27 +560,36 @@ async def ingest_audio(
                 
                 documents = []
                 for i, segment in enumerate(segments):
-                    if segment.speaker:
-                        speakers.add(segment.speaker)
+                    # Collect speaker info
+                    speaker_label = segment.speaker if segment.speaker else "Unknown"
+                    if speaker_label and speaker_label != "Unknown":
+                        speakers.add(speaker_label)
                     
+                    # Create document with proper speaker label
                     doc = {
                         "id": f"{file.filename}_segment_{i}",
                         "content": segment.text,
-                        "timestamp_start": segment.start_time,
-                        "timestamp_end": segment.end_time,
-                        "speaker": segment.speaker or "Unknown",
+                        "timestamp_start": round(segment.start_time, 2),  # Round to 2 decimal places
+                        "timestamp_end": round(segment.end_time, 2),
+                        "speaker": speaker_label,  # ← FIX: Use the actual speaker label
                         "source_file": file.filename,
                         "source_type": "audio"
                     }
                     documents.append(doc)
                 
+                # Log sample document to verify
+                if documents:
+                    logger.info(f"Sample document metadata: {documents[0]}")
+                
                 ids = vector_store.add_documents(documents, source_type="audio")
                 items_added = len(ids)
                 
                 logger.info(f"Added {items_added} audio segments to vector store")
+                logger.info(f"Speakers detected: {sorted(list(speakers)) if speakers else ['Unknown']}")
                 
             except Exception as e:
                 logger.error(f"Failed to add audio to vector store: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Failed to save to vector store: {str(e)}")
         
         return {
             "success": True,
@@ -571,7 +598,7 @@ async def ingest_audio(
             "items_added": items_added,
             "metadata": {
                 "num_segments": len(segments),
-                "total_duration": segments[-1].end_time if segments else 0,
+                "total_duration": round(segments[-1].end_time, 2) if segments else 0,
                 "speakers_detected": sorted(list(speakers)) if speakers else ["Unknown"],
                 "num_speakers": len(speakers) if speakers else 1,
                 "diarization_enabled": enable_diarization,
@@ -579,6 +606,8 @@ async def ingest_audio(
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Audio ingestion failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

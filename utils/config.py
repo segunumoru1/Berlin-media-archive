@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     
     # API Keys
     openai_api_key: str = Field(..., validation_alias="OPENAI_API_KEY")
+    diarization_method: str = Field(default="assemblyai", validation_alias="DIARIZATION_METHOD")
     huggingface_token: str = Field(default="", validation_alias="HUGGINGFACE_TOKEN")
     assemblyai_api_key: str = Field(default="", validation_alias="ASSEMBLYAI_API_KEY")
     
