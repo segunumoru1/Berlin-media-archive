@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # API Keys
     openai_api_key: str = Field(..., validation_alias="OPENAI_API_KEY")
     huggingface_token: str = Field(default="", validation_alias="HUGGINGFACE_TOKEN")
+    assemblyai_api_key: str = Field(default="", validation_alias="ASSEMBLYAI_API_KEY")
     
     # OpenAI Models
     llm_model: str = Field(default="gpt-4-turbo-preview", validation_alias="LLM_MODEL")

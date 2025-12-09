@@ -479,11 +479,16 @@ async def ingest_document(file: UploadFile = File(...)):
 @router.post("/ingest/audio")
 async def ingest_audio(
     file: UploadFile = File(...),
-    enable_diarization: bool = Query(default=False)
+    enable_diarization: bool = Query(default=False),
+    diarization_method: str = Query(default=None, description="'assemblyai', 'pyannote', or 'none'")
 ):
     """
     Ingest a single audio file.
-    Supports speaker diarization if enable_diarization=true and HUGGINGFACE_TOKEN is set.
+    
+    Diarization methods:
+    - assemblyai: Cloud-based, more accurate (requires ASSEMBLYAI_API_KEY)
+    - pyannote: Local processing (requires HUGGINGFACE_TOKEN)
+    - none: No speaker diarization
     """
     try:
         logger.info(f"Ingesting audio: {file.filename}")
@@ -499,13 +504,31 @@ async def ingest_audio(
         
         logger.info(f"Saved audio to: {file_path}")
         
-        # Process audio
-        from ingestion.audio_ingestion import AudioIngestionPipeline
+        # Determine diarization method
+        if diarization_method is None:
+            diarization_method = os.getenv("DIARIZATION_METHOD", "pyannote").lower()
         
-        audio_pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
-        output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
-        
-        segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
+        # Process audio based on method
+        if enable_diarization and diarization_method == "assemblyai":
+            try:
+                from ingestion.audio_ingestion_assemblyai import AssemblyAIAudioPipeline
+                logger.info("Using AssemblyAI for transcription and diarization")
+                audio_pipeline = AssemblyAIAudioPipeline(enable_diarization=True)
+                output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
+                segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
+            except Exception as e:
+                logger.warning(f"AssemblyAI failed: {e}, falling back to pyannote")
+                from ingestion.audio_ingestion import AudioIngestionPipeline
+                audio_pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
+                output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
+                segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
+        else:
+            # Use pyannote or no diarization
+            from ingestion.audio_ingestion import AudioIngestionPipeline
+            logger.info(f"Using Whisper + {'pyannote' if enable_diarization else 'no diarization'}")
+            audio_pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
+            output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
+            segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
         
         logger.info(f"Created {len(segments)} segments from audio")
         
@@ -549,9 +572,10 @@ async def ingest_audio(
             "metadata": {
                 "num_segments": len(segments),
                 "total_duration": segments[-1].end_time if segments else 0,
-                "speakers_detected": list(speakers) if speakers else ["Unknown"],
+                "speakers_detected": sorted(list(speakers)) if speakers else ["Unknown"],
                 "num_speakers": len(speakers) if speakers else 1,
-                "diarization_enabled": enable_diarization
+                "diarization_enabled": enable_diarization,
+                "diarization_method": diarization_method if enable_diarization else "none"
             }
         }
         
