@@ -11,6 +11,10 @@ from loguru import logger
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from chromadb.utils import embedding_functions
+from dotenv import load_dotenv
+
+# Load environment variables at module level
+load_dotenv()
 
 # Try to import BM25 for hybrid search
 try:
@@ -41,6 +45,9 @@ class UnifiedVectorStore:
             collection_name: Name of the collection
             reset_collection: If True, delete and recreate the collection
         """
+        # Ensure .env is loaded
+        load_dotenv(override=False)
+        
         self.persist_directory = persist_directory or os.getenv("VECTORSTORE_PATH", "./data/vectorstore")
         self.collection_name = collection_name or os.getenv("COLLECTION_NAME", "berlin_archive")
         
@@ -59,16 +66,22 @@ class UnifiedVectorStore:
         
         # Initialize OpenAI embedding function
         openai_api_key = os.getenv("OPENAI_API_KEY")
-        if openai_api_key:
-            self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
-                api_key=openai_api_key,
-                model_name=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-            )
-            logger.info(f"Using OpenAI embeddings: {os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')}")
+        
+        if openai_api_key and openai_api_key != "your_openai_api_key_here":
+            try:
+                self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+                    api_key=openai_api_key,
+                    model_name=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+                )
+                logger.info(f"✅ Using OpenAI embeddings: {os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')}")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI embeddings: {e}")
+                self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
+                logger.warning("Falling back to default embeddings")
         else:
-            # Fallback to default
             self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
-            logger.warning("No OpenAI API key found, using default embeddings")
+            logger.warning("⚠️  No OpenAI API key found, using default embeddings")
+            logger.warning("    Add OPENAI_API_KEY to .env file for better search quality")
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(
@@ -79,81 +92,81 @@ class UnifiedVectorStore:
             )
         )
         
-        # Handle collection creation with embedding function
-        self._initialize_collection(reset_collection)
+        # Handle collection creation/reset
+        if reset_collection:
+            self._reset_collection()
+        else:
+            self._get_or_create_collection()
         
         logger.info(f"UnifiedVectorStore initialized: {self.collection_name} at {self.persist_directory}")
         logger.info(f"Collection has {self.collection.count()} documents")
         logger.info(f"Hybrid search: {'enabled' if self.enable_hybrid and BM25_AVAILABLE else 'disabled'}")
     
-    def _initialize_collection(self, reset_collection: bool = False):
-        """
-        Initialize or reset the collection with proper embedding function.
-        """
+    def _reset_collection(self):
+        """Delete and recreate the collection."""
         try:
             # Check if collection exists
             existing_collections = [c.name for c in self.client.list_collections()]
-            collection_exists = self.collection_name in existing_collections
             
-            if reset_collection and collection_exists:
-                logger.info(f"Resetting collection: {self.collection_name}")
+            if self.collection_name in existing_collections:
+                logger.info(f"Deleting existing collection: {self.collection_name}")
                 self.client.delete_collection(self.collection_name)
-                collection_exists = False
             
-            if collection_exists:
-                # Try to get existing collection
-                try:
-                    # First try without embedding function to check compatibility
-                    self.collection = self.client.get_collection(
-                        name=self.collection_name,
-                        embedding_function=self.embedding_function
-                    )
-                except ValueError as e:
-                    if "embedding function" in str(e).lower():
-                        # Embedding function conflict - need to recreate
-                        logger.warning(f"Embedding function conflict detected. Recreating collection...")
-                        logger.warning("⚠️  Existing documents will be lost. Please re-ingest after restart.")
-                        
-                        self.client.delete_collection(self.collection_name)
-                        self.collection = self.client.create_collection(
-                            name=self.collection_name,
-                            embedding_function=self.embedding_function,
-                            metadata={"hnsw:space": "cosine"}
-                        )
-                    else:
-                        raise
-            else:
-                # Create new collection
-                self.collection = self.client.create_collection(
-                    name=self.collection_name,
-                    embedding_function=self.embedding_function,
-                    metadata={"hnsw:space": "cosine"}
-                )
-                logger.info(f"Created new collection: {self.collection_name}")
-                
+            # Create new collection
+            self.collection = self.client.create_collection(
+                name=self.collection_name,
+                embedding_function=self.embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.info(f"✅ Created new collection: {self.collection_name}")
+            
         except Exception as e:
-            logger.error(f"Failed to initialize collection: {e}")
+            logger.error(f"Failed to reset collection: {e}")
             raise
     
+    def _get_or_create_collection(self):
+        """Get existing collection or create new one."""
+        try:
+            # Try to get existing collection
+            self.collection = self.client.get_collection(
+                name=self.collection_name,
+                embedding_function=self.embedding_function
+            )
+            logger.info(f"Loaded existing collection: {self.collection_name}")
+            
+        except Exception as e:
+            # Collection doesn't exist or embedding mismatch, create new one
+            if "does not exist" in str(e).lower():
+                logger.info(f"Collection doesn't exist, creating: {self.collection_name}")
+            elif "embedding" in str(e).lower():
+                logger.warning(f"Embedding function mismatch detected")
+                logger.warning("⚠️  Deleting old collection and creating new one")
+                try:
+                    self.client.delete_collection(self.collection_name)
+                except:
+                    pass
+            
+            self.collection = self.client.create_collection(
+                name=self.collection_name,
+                embedding_function=self.embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.info(f"✅ Created new collection: {self.collection_name}")
+    
     def _build_where_clause(self, filters: Optional[Dict[str, Any]]) -> Optional[Dict]:
-        """
-        Build ChromaDB where clause from filters.
-        """
+        """Build ChromaDB where clause from filters."""
         if not filters:
             return None
         
-        # Remove None values
         filters = {k: v for k, v in filters.items() if v is not None}
         
         if not filters:
             return None
         
-        # Single filter
         if len(filters) == 1:
             key, value = list(filters.items())[0]
             return {key: {"$eq": value}}
         
-        # Multiple filters - use $and operator
         conditions = [{k: {"$eq": v}} for k, v in filters.items()]
         return {"$and": conditions}
     
@@ -163,22 +176,17 @@ class UnifiedVectorStore:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         ids: Optional[List[str]] = None
     ) -> List[str]:
-        """
-        Add texts to the vector store.
-        """
+        """Add texts to the vector store."""
         if not texts:
             logger.warning("No texts provided to add_texts")
             return []
         
-        # Generate IDs if not provided
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts]
         
-        # Ensure metadatas list matches texts
         if metadatas is None:
             metadatas = [{} for _ in texts]
         
-        # Clean metadata - ChromaDB only accepts str, int, float, bool
         cleaned_metadatas = []
         for meta in metadatas:
             cleaned = {}
@@ -198,7 +206,6 @@ class UnifiedVectorStore:
                 ids=ids
             )
             
-            # Invalidate BM25 index
             self._bm25_index = None
             
             logger.info(f"Added {len(texts)} texts to vector store")
@@ -213,9 +220,7 @@ class UnifiedVectorStore:
         documents: List[Dict[str, Any]],
         source_type: str = "document"
     ) -> List[str]:
-        """
-        Add documents with metadata to vector store.
-        """
+        """Add documents with metadata to vector store."""
         texts = []
         metadatas = []
         ids = []
@@ -243,7 +248,7 @@ class UnifiedVectorStore:
         return self.add_texts(texts=texts, metadatas=metadatas, ids=ids)
     
     def _build_bm25_index(self):
-        """Build BM25 index from all documents in collection."""
+        """Build BM25 index from all documents."""
         if not BM25_AVAILABLE:
             return
         
@@ -273,9 +278,7 @@ class UnifiedVectorStore:
         top_k: int = 5,
         filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Search for similar documents using semantic search.
-        """
+        """Search for similar documents."""
         try:
             doc_count = self.collection.count()
             logger.info(f"Searching in collection with {doc_count} documents")
@@ -285,6 +288,8 @@ class UnifiedVectorStore:
                 return []
             
             where = self._build_where_clause(filters)
+            
+            logger.debug(f"Search query: {query[:50]}..., where clause: {where}")
             
             results = self.collection.query(
                 query_texts=[query],
@@ -318,9 +323,7 @@ class UnifiedVectorStore:
         filters: Optional[Dict[str, Any]] = None,
         bm25_weight: Optional[float] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Hybrid search combining semantic search with BM25.
-        """
+        """Hybrid search combining semantic and BM25."""
         bm25_weight = bm25_weight if bm25_weight is not None else self.bm25_weight
         
         if not self.enable_hybrid or not BM25_AVAILABLE:
@@ -374,7 +377,7 @@ class UnifiedVectorStore:
             logger.error(f"Hybrid search failed: {e}")
             return self.search(query, top_k, filters)
     
-    def similarity_search(self, query: str, k: int = 5, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def similarity_search(self, query: str, k: int = 5, filter: Optional[Dict] = None) -> List[Dict]:
         return self.search(query=query, top_k=k, filters=filter)
     
     def get_collection_stats(self) -> Dict[str, Any]:
@@ -416,15 +419,16 @@ class UnifiedVectorStore:
             if not all_docs or not all_docs['documents']:
                 return []
             
-            return [
-                {
+            documents = []
+            for i, doc in enumerate(all_docs['documents']):
+                documents.append({
                     "content": doc,
                     "document": doc,
                     "metadata": all_docs['metadatas'][i] if all_docs['metadatas'] else {},
                     "id": all_docs['ids'][i] if all_docs['ids'] else None
-                }
-                for i, doc in enumerate(all_docs['documents'])
-            ]
+                })
+            
+            return documents
             
         except Exception as e:
             logger.error(f"Failed to get all documents: {e}")

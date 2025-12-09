@@ -307,24 +307,44 @@ async def ingest_audio(
     try:
         logger.info(f"Ingesting audio: {file.filename}")
         
+        # Validate file type
+        allowed_extensions = [".mp3", ".wav", ".m4a", ".flac", ".ogg"]
+        file_ext = Path(file.filename).suffix.lower()
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported audio format: {file_ext}. Allowed: {allowed_extensions}"
+            )
+        
         # Save file
         audio_dir = Path(os.getenv("AUDIO_DIR", "./data/audio"))
         audio_dir.mkdir(parents=True, exist_ok=True)
         
-        file_path = audio_dir / file.filename
+        # Use absolute path
+        file_path = (audio_dir / file.filename).resolve()
+        
+        logger.info(f"Saving to: {file_path}")
+        
         with open(file_path, "wb") as f:
             content = await file.read()
             f.write(content)
         
-        logger.info(f"Saved audio to: {file_path}")
+        # Verify file was saved
+        if not file_path.exists():
+            raise HTTPException(status_code=500, detail=f"Failed to save audio file to {file_path}")
+        
+        logger.info(f"Audio file saved successfully: {file_path} ({file_path.stat().st_size} bytes)")
         
         # Process audio
         from ingestion.audio_ingestion import AudioIngestionPipeline
         
         audio_pipeline = AudioIngestionPipeline(enable_diarization=enable_diarization)
-        output_dir = os.getenv("OUTPUT_DIR", "./output") + "/audio"
+        output_dir = Path(os.getenv("OUTPUT_DIR", "./output")) / "audio"
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        segments = audio_pipeline.ingest_audio(str(file_path), output_dir)
+        # Use string path for ingestion
+        segments = audio_pipeline.ingest_audio(str(file_path), str(output_dir))
         
         logger.info(f"Created {len(segments)} segments from audio")
         
@@ -362,10 +382,13 @@ async def ingest_audio(
             "items_added": items_added,
             "metadata": {
                 "num_segments": len(segments),
-                "total_duration": segments[-1].end_time if segments else 0
+                "total_duration": segments[-1].end_time if segments else 0,
+                "file_size_bytes": file_path.stat().st_size
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Audio ingestion failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

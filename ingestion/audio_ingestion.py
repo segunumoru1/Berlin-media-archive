@@ -58,18 +58,70 @@ class AudioIngestionPipeline:
             except Exception as e:
                 logger.warning(f"Could not load diarization pipeline: {e}")
     
-    def transcribe_audio(self, audio_path: str) -> Dict[str, Any]:
-        """Transcribe audio using Whisper"""
-        logger.info(f"Transcribing: {audio_path}")
+    def transcribe_audio(self, audio_path: str) -> List[Dict[str, Any]]:
+        """
+        Transcribe audio using Whisper.
         
-        result = self.whisper_model.transcribe(
-            audio_path,
-            language="en",
-            task="transcribe",
-            verbose=False
-        )
-        
-        return result
+        Args:
+            audio_path: Path to audio file
+            
+        Returns:
+            List of transcript segments
+        """
+        try:
+            logger.info(f"Transcribing: {audio_path}")
+            
+            # Verify file exists
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            
+            # Load audio with error handling
+            try:
+                audio = whisper.load_audio(audio_path)
+            except Exception as e:
+                logger.error(f"Failed to load audio with whisper: {e}")
+                # Try with pydub as fallback
+                try:
+                    from pydub import AudioSegment
+                    audio_segment = AudioSegment.from_file(audio_path)
+                    
+                    # Export as wav for whisper
+                    temp_wav = audio_path.replace(Path(audio_path).suffix, "_temp.wav")
+                    audio_segment.export(temp_wav, format="wav")
+                    audio = whisper.load_audio(temp_wav)
+                    
+                    # Clean up temp file
+                    if os.path.exists(temp_wav):
+                        os.remove(temp_wav)
+                except Exception as e2:
+                    logger.error(f"Fallback audio loading failed: {e2}")
+                    raise
+            
+            audio = whisper.pad_or_trim(audio)
+            
+            # Transcribe
+            result = self.whisper_model.transcribe(
+                audio_path,
+                language="en",
+                task="transcribe",
+                verbose=False
+            )
+            
+            segments = []
+            for seg in result.get("segments", []):
+                segments.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"].strip(),
+                    "speaker": None  # Will be filled by diarization if enabled
+                })
+            
+            logger.info(f"Transcription complete: {len(segments)} segments")
+            return segments
+            
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+            raise
     
     def perform_diarization(self, audio_path: str) -> Optional[Dict]:
         """Perform speaker diarization"""
@@ -95,13 +147,13 @@ class AudioIngestionPipeline:
     
     def merge_transcription_with_speakers(
         self,
-        transcription: Dict[str, Any],
+        transcription: List[Dict[str, Any]],
         diarization: Optional[Dict]
     ) -> List[TranscriptSegment]:
         """Merge Whisper transcription with speaker labels"""
         segments = []
         
-        for segment in transcription.get("segments", []):
+        for segment in transcription:
             speaker = None
             
             if diarization:
@@ -181,5 +233,3 @@ class AudioIngestionPipeline:
         except Exception as e:
             logger.error(f"Audio ingestion failed: {e}", exc_info=True)
             raise
-
-    
