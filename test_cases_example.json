@@ -1,0 +1,19 @@
+[
+  {
+    "query": "What did Gary Neville say about Manchester City's first half performance?",
+    "answer": "Gary Neville described Manchester City's first half performance as 'awful'.",
+    "contexts": [
+      "The game was strange in the first half completely. I mean City were for them awful",
+      "City the one is two or three nil and Tottenham are not a go on and city dominated with two nil up after half"
+    ],
+    "citations": [
+      {
+        "source_file": "Neville_Carra.m4a",
+        "source_type": "audio",
+        "speaker": "SPEAKER_A",
+        "timestamp_start": 30.76
+      }
+    ],
+    "ground_truth": "Gary Neville said Manchester City's first half was awful but they dominated in the second half to win 2-0."
+  }
+]

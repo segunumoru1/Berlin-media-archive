@@ -263,52 +263,127 @@ def run(test_cases, output):
 
 
 @evaluate.command()
-@click.argument('question')
-@click.argument('answer')
-@click.option('--context', '-c', multiple=True, required=True, help='Context chunks')
-@click.option('--ground-truth', '-g', type=str, help='Ground truth answer')
-def single(question, answer, context, ground_truth):
-    """Evaluate a single question-answer pair"""
+@click.argument('query')
+@click.option('--answer', '-a', required=True, help='System answer')
+@click.option('--contexts', '-c', multiple=True, required=True, help='Retrieved contexts')
+@click.option('--ground-truth', '-g', help='Ground truth answer (optional)')
+def single(query: str, answer: str, contexts: tuple, ground_truth: Optional[str]):
+    """Evaluate a single query response."""
     try:
-        click.echo("📈 Evaluating single response...")
+        logger.info(f"Evaluating query: {query}")
         
-        from rag_evaluator.llm_rag_evaluator import LLMRAGEvaluator
+        # Initialize evaluator
+        from rag_evaluator.gemini_rag_evaluator import GeminiRAGEvaluator
+        evaluator = GeminiRAGEvaluator()
         
-        evaluator = LLMRAGEvaluator()
+        # Convert contexts tuple to list
+        contexts_list = list(contexts)
         
-        result = evaluator.evaluate_response(
-            question=question,
+        # Run evaluation
+        result = evaluator.evaluate(
+            query=query,
             answer=answer,
-            retrieved_context=list(context),
+            retrieved_contexts=contexts_list,
+            citations=[],  # Can be added if needed
             ground_truth=ground_truth
         )
         
-        click.echo(f"\n✅ Evaluation complete!")
-        click.echo(f"\n📊 Scores:")
+        # Print results
+        click.echo("\n" + "="*80)
+        click.echo("EVALUATION RESULTS")
+        click.echo("="*80 + "\n")
         
-        if isinstance(result, dict):
-            click.echo(f"   - Faithfulness: {result.get('faithfulness', 0):.2f}")
-            click.echo(f"   - Relevance: {result.get('relevance', 0):.2f}")
-            click.echo(f"   - Citation Quality: {result.get('citation_quality', 0):.2f}")
-            click.echo(f"   - Overall: {result.get('overall_score', 0):.2f}")
-            click.echo(f"   - Grade: {result.get('grade', 'N/A')}")
-            
-            is_production_ready = result.get('overall_score', 0) >= 0.7
-            production_ready = "✅ YES" if is_production_ready else "❌ NO"
-            click.echo(f"\n   Production Ready: {production_ready}")
-            
-            if result.get('errors'):
-                click.echo(f"\n⚠️  Errors:")
-                for error in result['errors']:
-                    click.echo(f"   - {error}")
-            
-            if result.get('warnings'):
-                click.echo(f"\n⚠️  Warnings:")
-                for warning in result['warnings']:
-                    click.echo(f"   - {warning}")
+        metrics = result.metrics
+        click.echo(f"Overall Score: {metrics.overall_score:.2f}")
+        click.echo(f"\nRetrieval Quality:")
+        click.echo(f"  Precision: {metrics.retrieval_precision:.2f}")
+        click.echo(f"  Recall: {metrics.retrieval_recall:.2f}")
+        
+        click.echo(f"\nAnswer Quality:")
+        click.echo(f"  Relevance: {metrics.answer_relevance:.2f}")
+        click.echo(f"  Correctness: {metrics.answer_correctness:.2f}")
+        click.echo(f"  Completeness: {metrics.answer_completeness:.2f}")
+        
+        click.echo(f"\nCitation Quality:")
+        click.echo(f"  Accuracy: {metrics.citation_accuracy:.2f}")
+        click.echo(f"  Coverage: {metrics.citation_coverage:.2f}")
+        
+        click.echo(f"\n✅ Strengths:")
+        for s in metrics.strengths:
+            click.echo(f"  • {s}")
+        
+        click.echo(f"\n⚠️  Weaknesses:")
+        for w in metrics.weaknesses:
+            click.echo(f"  • {w}")
+        
+        click.echo(f"\n💡 Suggestions:")
+        for s in metrics.suggestions:
+            click.echo(f"  • {s}")
         
     except Exception as e:
-        logger.error(f"Evaluation failed: {e}", exc_info=True)
+        logger.error(f"Evaluation failed: {e}")
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@evaluate.command()
+@click.argument('test_cases_file', type=click.Path(exists=True))
+@click.option('--output', '-o', type=click.Path(), help='Output file for report')
+def batch(test_cases_file: str, output: Optional[str]):
+    """
+    Evaluate multiple test cases from a JSON file.
+    
+    JSON format:
+    [
+        {
+            "query": "...",
+            "answer": "...",
+            "contexts": [...],
+            "citations": [...],
+            "ground_truth": "..." (optional)
+        }
+    ]
+    """
+    try:
+        logger.info(f"Loading test cases from: {test_cases_file}")
+        
+        # Load test cases
+        with open(test_cases_file, 'r', encoding='utf-8') as f:
+            test_cases = json.load(f)
+        
+        click.echo(f"Loaded {len(test_cases)} test cases")
+        
+        # Initialize evaluator
+        from rag_evaluator.gemini_rag_evaluator import GeminiRAGEvaluator
+        evaluator = GeminiRAGEvaluator()
+        
+        # Run batch evaluation
+        click.echo("Evaluating...")
+        results = evaluator.evaluate_batch(test_cases)
+        
+        # Generate report
+        output_file = output or f"evaluation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report = evaluator.generate_report(results, output_path=output_file)
+        
+        # Print summary
+        click.echo("\n" + "="*80)
+        click.echo("EVALUATION SUMMARY")
+        click.echo("="*80 + "\n")
+        
+        summary = report['summary']
+        click.echo(f"Total Evaluations: {summary['total_evaluations']}")
+        click.echo(f"\nAverage Scores:")
+        for metric, score in summary['average_scores'].items():
+            click.echo(f"  {metric}: {score:.2f}")
+        
+        click.echo(f"\nScore Distribution:")
+        for category, count in summary['score_distribution'].items():
+            click.echo(f"  {category}: {count}")
+        
+        click.echo(f"\n✅ Report saved to: {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Batch evaluation failed: {e}")
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
 

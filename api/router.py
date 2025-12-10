@@ -9,13 +9,26 @@ from loguru import logger
 import os
 from pathlib import Path
 from datetime import datetime
-import asyncio
+from rag_evaluator.gemini_rag_evaluator import GeminiRAGEvaluator, EvaluationResult
 
 # Create router WITHOUT prefix
 router = APIRouter()
 
 
 # Request/Response Models
+class EvaluationRequest(BaseModel):
+    query: str
+    answer: str
+    contexts: List[str]
+    citations: List[Dict[str, Any]]
+    ground_truth: Optional[str] = None
+
+
+class BatchEvaluationRequest(BaseModel):
+    test_cases: List[Dict[str, Any]]
+    output_file: Optional[str] = None
+
+
 class QueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 5
@@ -707,4 +720,126 @@ async def clear_documents():
         
     except Exception as e:
         logger.error(f"Failed to clear documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+# ============= Evaluation Endpoints =============
+
+@router.post("/evaluate/response")
+async def evaluate_response(request: EvaluationRequest):
+    """
+    Evaluate a single RAG response using Gemini as judge.
+    
+    Returns detailed metrics on retrieval quality, answer quality, and citation accuracy.
+    
+    Request body:
+    {
+        "query": "What did Gary say?",
+        "answer": "Gary said...",
+        "contexts": ["context 1", "context 2"],
+        "citations": [{"source": "file.mp3", ...}],
+        "ground_truth": "Optional ground truth answer"
+    }
+    """
+    try:
+        logger.info(f"Evaluating response for query: {request.query[:50]}...")
+        
+        # Initialize evaluator
+        evaluator = GeminiRAGEvaluator()
+        
+        # Run evaluation
+        result = evaluator.evaluate(
+            query=request.query,
+            answer=request.answer,
+            retrieved_contexts=request.contexts,
+            citations=request.citations,
+            ground_truth=request.ground_truth
+        )
+        
+        return result.to_dict()
+        
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/evaluate/query-result")
+async def evaluate_query_result(request: QueryRequest):
+    """
+    Query the archive and automatically evaluate the response.
+    
+    Combines query execution with evaluation for testing purposes.
+    
+    Request body:
+    {
+        "query": "What did Gary Neville say?",
+        "top_k": 5,
+        "filter_speaker": "SPEAKER_A"  (optional)
+    }
+    """
+    try:
+        # First, execute the query
+        query_response = await query_archive(request)
+        
+        # Extract data for evaluation
+        contexts = [cite['content_preview'] for cite in query_response.citations]
+        
+        # Evaluate the response
+        evaluator = GeminiRAGEvaluator()
+        evaluation_result = evaluator.evaluate(
+            query=query_response.query,
+            answer=query_response.answer,
+            retrieved_contexts=contexts,
+            citations=query_response.citations,
+            ground_truth=None
+        )
+        
+        return {
+            "query_response": query_response.dict(),
+            "evaluation": evaluation_result.to_dict()
+        }
+        
+    except Exception as e:
+        logger.error(f"Query+Evaluation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/evaluate/batch")
+async def evaluate_batch(request: BatchEvaluationRequest):
+    """
+    Evaluate multiple test cases and generate a report.
+    
+    Request body:
+    {
+        "test_cases": [
+            {
+                "query": "...",
+                "answer": "...",
+                "contexts": [...],
+                "citations": [...],
+                "ground_truth": "..." (optional)
+            }
+        ],
+        "output_file": "results.json"  (optional)
+    }
+    """
+    try:
+        logger.info(f"Batch evaluation: {len(request.test_cases)} test cases")
+        
+        # Initialize evaluator
+        evaluator = GeminiRAGEvaluator()
+        
+        # Evaluate batch
+        results = evaluator.evaluate_batch(request.test_cases)
+        
+        # Generate report
+        report = evaluator.generate_report(
+            results=results,
+            output_path=request.output_file
+        )
+        
+        return report
+        
+    except Exception as e:
+        logger.error(f"Batch evaluation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
