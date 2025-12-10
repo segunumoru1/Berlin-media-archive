@@ -75,7 +75,7 @@ class GeminiRAGEvaluator:
     
     def __init__(
         self,
-        model_name: str = "gemini-1.5-flash-preview",
+        model_name: str = "gemini-2.0-flash-exp",
         api_key: Optional[str] = None
     ):
         """
