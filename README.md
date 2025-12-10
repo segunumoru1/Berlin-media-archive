@@ -1445,5 +1445,3 @@ python test_gemini_models.py
 **Built with ❤️ for the Berlin Media Archive Technical Assessment**
 
 **Tech Stack**: Python 3.9+ | FastAPI | ChromaDB | OpenAI GPT-4 | Google Gemini | AssemblyAI | Whisper | Pyannote
-
-**Demo Video**: [Link to video recording]
