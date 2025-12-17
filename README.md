@@ -39,6 +39,8 @@ The Berlin Media Archive is designed to solve a real-world problem: enabling his
 **Expected Response:**
 > Gary Neville described Manchester City's first half performance as "awful" [Source: Match Analysis 00:30 (SPEAKER_A)], but noted they "dominated with two nil up after half" [Source: Match Analysis 05:23 (SPEAKER_A)]. The team showed resilience despite early struggles.
 
+**Check out the Demo Video:**
+![Demo Video](https://drive.google.com/file/d/10Az_oEAAecRTyNjx1vJu8weWlbhCjFy5/view)
 ---
 
 ## ✨ Features
